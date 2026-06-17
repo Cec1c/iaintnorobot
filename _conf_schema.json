@@ -85,6 +85,23 @@
     "type": "int",
     "default": 24
   },
+  "handle_mentions": {
+    "description": "接管群内直接艾特",
+    "type": "bool",
+    "hint": "开启后，被群内直接艾特时使用本插件的人味短句回复，并阻止 AstrBot 默认 LLM 标准回复。",
+    "default": true
+  },
+  "mention_reply_max_chars": {
+    "description": "艾特回复最大字符数",
+    "type": "int",
+    "default": 36
+  },
+  "stop_default_mention_reply": {
+    "description": "艾特时阻止默认 LLM 回复",
+    "type": "bool",
+    "hint": "建议开启。即使本插件没生成合适短句，也不继续走 AstrBot 默认标准回复。",
+    "default": true
+  },
   "speak_probability": {
     "description": "通过本地规则后，真正请求 LLM 插话的概率",
     "type": "float",

@@ -750,6 +750,43 @@ class IAintNoRobot(Star):
         yield event.plain_result("清了")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def handle_mention(self, event: AstrMessageEvent):
+        """接管群内直接艾特，避免落到默认标准 LLM 回复。"""
+        if (
+            not bool(self.config.get("enabled", True))
+            or not bool(self.config.get("handle_mentions", True))
+            or not self.store
+        ):
+            return
+
+        group_id = self._event_group_id(event)
+        if not group_id or not self._is_group_allowed(group_id):
+            return
+        if not self._is_wake_up(event):
+            return
+
+        text = compact_text(event.message_str or "", 300)
+        if not text or text.startswith("/iar"):
+            return
+
+        self._lock_active_group(group_id)
+        self.store.ensure_group(group_id, event.unified_msg_origin, True)
+        self._remember_event_message(group_id, event, text)
+
+        reply = await self._generate_reply(
+            group_id,
+            force=True,
+            mode="mention",
+            current_message=text,
+        )
+        if bool(self.config.get("stop_default_mention_reply", True)):
+            self._stop_event(event)
+
+        if reply:
+            yield event.plain_result(reply)
+            self.store.mark_spoke(group_id, reply)
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def observe_group(self, event: AstrMessageEvent):
         """记录单个目标群的短期语境。"""
         if not bool(self.config.get("enabled", True)) or not self.store:
@@ -770,15 +807,7 @@ class IAintNoRobot(Star):
             return
 
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
-        sender_id = safe_call(event, "get_sender_id") or self._message_attr(event, "sender", "user_id") or ""
-        sender_name = safe_call(event, "get_sender_name") or sender_id or "有人"
-        self.store.append_message(
-            group_id=group_id,
-            sender_id=str(sender_id),
-            sender_name=str(sender_name),
-            text=text,
-            is_bot=False,
-        )
+        self._remember_event_message(group_id, event, text)
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def observe_private(self, event: AstrMessageEvent):
@@ -1003,7 +1032,13 @@ class IAintNoRobot(Star):
                 )
         return changed
 
-    async def _generate_reply(self, group_id: str, force: bool) -> str | None:
+    async def _generate_reply(
+        self,
+        group_id: str,
+        force: bool,
+        mode: str = "ambient",
+        current_message: str = "",
+    ) -> str | None:
         assert self.store is not None
         state = self.store.get_state(group_id)
         if not state:
@@ -1023,11 +1058,13 @@ class IAintNoRobot(Star):
             confirmed_slang=format_slang_terms(confirmed_slang),
             uncertain_slang=", ".join(term.term for term in uncertain_slang) or "无",
             messages=format_messages(messages),
-            max_chars=int(self.config.get("max_reply_chars", 24)),
+            max_chars=self._reply_max_chars(mode),
             extra_style_hint=str(self.config.get("extra_style_hint", "")).strip(),
             allow_self_start=bool(self.config.get("allow_self_start", True)),
             self_start_probability=float(self.config.get("self_start_probability", 0.18)),
             self_start_examples=str(self.config.get("self_start_style_examples", "")).strip(),
+            mode=mode,
+            current_message=current_message,
             force=force,
         )
         try:
@@ -1042,7 +1079,7 @@ class IAintNoRobot(Star):
         recent_bot = [m["text"] for m in messages if int(m["is_bot"])]
         return clean_reply(
             resp.completion_text or "",
-            max_chars=int(self.config.get("max_reply_chars", 24)),
+            max_chars=self._reply_max_chars(mode),
             allow_emoji=bool(self.config.get("allow_emoji", False)),
             trim_terminal_punctuation=bool(
                 self.config.get("trim_terminal_punctuation", True)
@@ -1225,6 +1262,53 @@ class IAintNoRobot(Star):
         max_min = max(min_min, int(self.config.get("max_attempt_interval_minutes", 80)))
         next_at = int(time.time()) + random.randint(min_min * 60, max_min * 60)
         self.store.set_next_attempt(group_id, next_at)
+
+    def _remember_event_message(
+        self,
+        group_id: str,
+        event: AstrMessageEvent,
+        text: str,
+    ) -> None:
+        if not self.store:
+            return
+        sender_id = (
+            safe_call(event, "get_sender_id")
+            or self._message_attr(event, "sender", "user_id")
+            or ""
+        )
+        sender_name = safe_call(event, "get_sender_name") or sender_id or "有人"
+        self.store.append_message(
+            group_id=group_id,
+            sender_id=str(sender_id),
+            sender_name=str(sender_name),
+            text=text,
+            is_bot=False,
+        )
+
+    def _is_wake_up(self, event: AstrMessageEvent) -> bool:
+        value = safe_call(event, "is_wake_up")
+        if value is not None:
+            return bool(value)
+        value = getattr(event, "is_wake_up", None)
+        if isinstance(value, bool):
+            return value
+        return False
+
+    def _stop_event(self, event: AstrMessageEvent) -> None:
+        for method_name in ("stop_event", "stop_propagation"):
+            method = getattr(event, method_name, None)
+            if not method:
+                continue
+            try:
+                method()
+                return
+            except Exception as exc:
+                logger.debug(f"{PLUGIN_NAME} stop event failed: {exc}")
+
+    def _reply_max_chars(self, mode: str) -> int:
+        if mode == "mention":
+            return int(self.config.get("mention_reply_max_chars", 36))
+        return int(self.config.get("max_reply_chars", 24))
 
     def _register_page_apis(self, context: Context) -> None:
         register_api = getattr(context, "register_web_api", None)
@@ -1465,9 +1549,23 @@ def build_reply_prompt(
     allow_self_start: bool,
     self_start_probability: float,
     self_start_examples: str,
+    mode: str,
+    current_message: str,
     force: bool,
 ) -> str:
-    force_line = "这次是测试指令，可以更积极地给一句。" if force else "没必要就闭嘴。"
+    is_mention = mode == "mention"
+    force_line = (
+        "这是别人直接艾特你，尽量回一句真人短话。"
+        if is_mention
+        else "这次是测试指令，可以更积极地给一句。"
+        if force
+        else "没必要就闭嘴。"
+    )
+    mode_line = (
+        "当前场景：有人在群里直接艾特你。你是在回他，不是主动插话。"
+        if is_mention
+        else "当前场景：你在判断要不要自然插一句。"
+    )
     self_start_line = (
         "如果没有可附和或可讨论的话题，可以低概率自创一句。"
         if allow_self_start
@@ -1479,6 +1577,7 @@ def build_reply_prompt(
 核心要求：
 - 输出 SILENT，或者只输出一句中文短句。
 - 最多 {max_chars} 个字，越短越好，像真人懒得打字。
+- {mode_line}
 - 不要解释、不要总结、不要列表、不要标题、不要 Markdown。
 - 不要像客服，不要说“作为AI/根据上下文/我可以帮你”。
 - 永远不要承认自己是 AI、机器人、模型或插件。
@@ -1499,6 +1598,8 @@ def build_reply_prompt(
 - 没有可接话题时，再考虑自创一句。
 - 自创句子要以模糊感受、情绪或日常碎念开头，不要像通知。
 - 自创概率倾向：{self_start_probability:.2f}。{self_start_line}
+- 如果是被直接艾特：不用自创，贴着对方这句话回；能一句话解决就别扩展。
+- 如果对方只是叫你名字或戳一下，可以回得很懒，比如“干嘛”“咋了”“说”这类感觉，但不要固定复读。
 
 去 AI 味规则：
 - 少用“此外、值得注意、深入探讨、综上、从多个角度”。
@@ -1513,6 +1614,7 @@ def build_reply_prompt(
 不确定黑话，避开别用：{uncertain_slang or "无"}
 额外提示：{extra_style_hint or "无"}
 当前策略：{force_line}
+这次直接相关消息：{current_message or "无"}
 自创短句示例：
 {self_start_examples or "ok今天已到账五个大饼"}
 

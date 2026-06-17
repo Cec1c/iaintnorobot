@@ -86,6 +86,14 @@ self_start_style_examples
 控制“无话题时自创一句”。自创句子会偏模糊感受或情绪表达，例如“ok今天已到账五个大饼”。建议概率保持较低。
 
 ```text
+handle_mentions
+mention_reply_max_chars
+stop_default_mention_reply
+```
+
+控制群内直接艾特。开启后，被艾特时会使用插件的人味短句回复；默认阻止 AstrBot 标准 LLM 回复，避免冒出一大段客服腔。
+
+```text
 learn_slang
 slang_scan_interval_minutes
 max_slang_terms
