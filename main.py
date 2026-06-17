@@ -72,14 +72,26 @@ class GroupState:
     last_spoke_at: int
     next_attempt_at: int
     last_summarized_at: int
+    last_slang_scanned_at: int
     style_summary: str
     topic_summary: str
 
 
+@dataclass
+class SlangTerm:
+    term: str
+    meaning: str
+    confidence: float
+    status: str
+    source: str
+    updated_at: int
+
+
 class MemoryStore:
-    def __init__(self, db_path: Path, recent_limit: int):
+    def __init__(self, db_path: Path, recent_limit: int, max_slang_terms: int):
         self.db_path = db_path
         self.recent_limit = max(20, int(recent_limit))
+        self.max_slang_terms = max(10, int(max_slang_terms))
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,11 +107,13 @@ class MemoryStore:
                     last_spoke_at integer not null default 0,
                     next_attempt_at integer not null default 0,
                     last_summarized_at integer not null default 0,
+                    last_slang_scanned_at integer not null default 0,
                     style_summary text not null default '',
                     topic_summary text not null default ''
                 )
                 """
             )
+            self._ensure_column(conn, "group_state", "last_slang_scanned_at", "integer not null default 0")
             conn.execute(
                 """
                 create table if not exists recent_messages (
@@ -116,11 +130,56 @@ class MemoryStore:
             conn.execute(
                 "create index if not exists idx_recent_group_time on recent_messages(group_id, created_at)"
             )
+            conn.execute(
+                """
+                create table if not exists slang_terms (
+                    group_id text not null,
+                    term text not null,
+                    meaning text not null default '',
+                    confidence real not null default 0,
+                    status text not null default 'uncertain',
+                    source text not null default 'llm',
+                    last_seen_at integer not null,
+                    updated_at integer not null,
+                    primary key (group_id, term)
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists insider_questions (
+                    id integer primary key autoincrement,
+                    group_id text not null,
+                    term text not null,
+                    question text not null,
+                    status text not null default 'pending',
+                    created_at integer not null,
+                    answered_at integer not null default 0
+                )
+                """
+            )
+            conn.execute(
+                "create index if not exists idx_insider_status on insider_questions(status, created_at)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _ensure_column(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        column_def: str,
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute(f"pragma table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            conn.execute(f"alter table {table_name} add column {column_name} {column_def}")
 
     def ensure_group(self, group_id: str, umo: str, enabled: bool = True) -> None:
         now = int(time.time())
@@ -238,6 +297,154 @@ class MemoryStore:
                 ),
             )
 
+    def mark_slang_scanned(self, group_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "update group_state set last_slang_scanned_at = ? where group_id = ?",
+                (int(time.time()), group_id),
+            )
+
+    def upsert_slang(
+        self,
+        group_id: str,
+        term: str,
+        meaning: str,
+        confidence: float,
+        status: str,
+        source: str,
+    ) -> None:
+        term = compact_text(term, 40)
+        meaning = compact_text(meaning, 160)
+        if not term:
+            return
+        confidence = max(0.0, min(1.0, float(confidence)))
+        status = "confirmed" if status == "confirmed" else "uncertain"
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                insert into slang_terms (
+                    group_id, term, meaning, confidence, status, source, last_seen_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(group_id, term) do update set
+                    meaning = case
+                        when excluded.status = 'confirmed' or slang_terms.status != 'confirmed'
+                        then excluded.meaning
+                        else slang_terms.meaning
+                    end,
+                    confidence = max(slang_terms.confidence, excluded.confidence),
+                    status = case
+                        when excluded.status = 'confirmed' then 'confirmed'
+                        else slang_terms.status
+                    end,
+                    source = excluded.source,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at
+                """,
+                (group_id, term, meaning, confidence, status, source, now, now),
+            )
+            self._trim_slang_terms(conn, group_id)
+
+    def _trim_slang_terms(self, conn: sqlite3.Connection, group_id: str) -> None:
+        conn.execute(
+            """
+            delete from slang_terms
+            where group_id = ?
+              and term not in (
+                  select term from slang_terms
+                  where group_id = ?
+                  order by
+                      case status when 'confirmed' then 1 else 0 end desc,
+                      updated_at desc
+                  limit ?
+              )
+            """,
+            (group_id, group_id, self.max_slang_terms),
+        )
+
+    def get_slang_terms(
+        self,
+        group_id: str,
+        status: str | None = None,
+        limit: int = 30,
+    ) -> list[SlangTerm]:
+        limit = max(1, int(limit))
+        sql = """
+            select term, meaning, confidence, status, source, updated_at
+            from slang_terms
+            where group_id = ?
+        """
+        args: list[Any] = [group_id]
+        if status:
+            sql += " and status = ?"
+            args.append(status)
+        sql += " order by updated_at desc limit ?"
+        args.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [
+            SlangTerm(
+                term=str(row["term"]),
+                meaning=str(row["meaning"] or ""),
+                confidence=float(row["confidence"]),
+                status=str(row["status"]),
+                source=str(row["source"]),
+                updated_at=int(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def add_insider_question(self, group_id: str, term: str, question: str) -> int:
+        now = int(time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                insert into insider_questions (group_id, term, question, status, created_at)
+                values (?, ?, ?, 'pending', ?)
+                """,
+                (group_id, compact_text(term, 40), compact_text(question, 500), now),
+            )
+            return int(cur.lastrowid)
+
+    def get_recent_insider_question(self, group_id: str, term: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                select created_at from insider_questions
+                where group_id = ? and term = ?
+                order by created_at desc
+                limit 1
+                """,
+                (group_id, term),
+            ).fetchone()
+        return int(row["created_at"]) if row else 0
+
+    def get_pending_insider_questions(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                select id, group_id, term, question, created_at
+                from insider_questions
+                where status = 'pending'
+                order by created_at desc
+                limit ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_insider_answered(self, question_id: int) -> None:
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                update insider_questions
+                set status = 'answered', answered_at = ?
+                where id = ?
+                """,
+                (now, question_id),
+            )
+
     def get_recent_messages(self, group_id: str, limit: int) -> list[dict[str, Any]]:
         limit = max(1, int(limit))
         with self._connect() as conn:
@@ -267,12 +474,15 @@ class MemoryStore:
     def clear_group(self, group_id: str) -> None:
         with self._connect() as conn:
             conn.execute("delete from recent_messages where group_id = ?", (group_id,))
+            conn.execute("delete from slang_terms where group_id = ?", (group_id,))
+            conn.execute("delete from insider_questions where group_id = ?", (group_id,))
             conn.execute(
                 """
                 update group_state
                 set last_spoke_at = 0,
                     next_attempt_at = 0,
                     last_summarized_at = 0,
+                    last_slang_scanned_at = 0,
                     style_summary = '',
                     topic_summary = ''
                 where group_id = ?
@@ -293,9 +503,22 @@ class MemoryStore:
                 """,
                 (group_id,),
             ).fetchone()
+            slang_count = conn.execute(
+                "select count(*) as c from slang_terms where group_id = ?",
+                (group_id,),
+            ).fetchone()
+            confirmed_slang_count = conn.execute(
+                """
+                select count(*) as c from slang_terms
+                where group_id = ? and status = 'confirmed'
+                """,
+                (group_id,),
+            ).fetchone()
         return {
             "messages": int(msg_count["c"]) if msg_count else 0,
             "bot_messages": int(bot_count["c"]) if bot_count else 0,
+            "slang_terms": int(slang_count["c"]) if slang_count else 0,
+            "confirmed_slang_terms": int(confirmed_slang_count["c"]) if confirmed_slang_count else 0,
         }
 
     def _row_to_state(self, row: sqlite3.Row) -> GroupState:
@@ -307,12 +530,13 @@ class MemoryStore:
             last_spoke_at=int(row["last_spoke_at"]),
             next_attempt_at=int(row["next_attempt_at"]),
             last_summarized_at=int(row["last_summarized_at"]),
+            last_slang_scanned_at=int(row["last_slang_scanned_at"]),
             style_summary=str(row["style_summary"] or ""),
             topic_summary=str(row["topic_summary"] or ""),
         )
 
 
-@register(PLUGIN_NAME, "15185", "单群低频自然插话原型", "0.1.0")
+@register(PLUGIN_NAME, "15185", "单群低频自然插话原型", "0.2.0")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -324,7 +548,8 @@ class IAintNoRobot(Star):
     async def initialize(self) -> None:
         data_dir = self._plugin_data_dir()
         recent_limit = int(self.config.get("recent_message_limit", 200))
-        self.store = MemoryStore(data_dir / "memory.sqlite3", recent_limit)
+        max_slang_terms = int(self.config.get("max_slang_terms", 80))
+        self.store = MemoryStore(data_dir / "memory.sqlite3", recent_limit, max_slang_terms)
         self.store.initialize()
         if not self.active_group_id:
             self.active_group_id = self.store.get_first_group_id() or ""
@@ -366,6 +591,7 @@ class IAintNoRobot(Star):
                     f"开关：{'开' if state.enabled else '关'}",
                     f"短期消息：{stats['messages']} 条",
                     f"机器人发过：{stats['bot_messages']} 条",
+                    f"黑话记忆：{stats['confirmed_slang_terms']}/{stats['slang_terms']} 条",
                     f"上次说话：{human_delta(now - state.last_spoke_at) if state.last_spoke_at else '还没'}",
                     f"下次尝试：{human_delta(max(0, state.next_attempt_at - now))}",
                     f"话题记忆：{state.topic_summary or '还没有'}",
@@ -427,6 +653,37 @@ class IAintNoRobot(Star):
             f"话题：{state.topic_summary or '无'}\n语气：{state.style_summary or '无'}"
         )
 
+    @iar.command("slang")
+    async def show_slang(self, event: AstrMessageEvent):
+        """查看当前群已理解的黑话。"""
+        group_id = self._event_group_id(event) or self.active_group_id
+        if not group_id or not self.store:
+            yield event.plain_result("还没观察到群")
+            return
+        terms = self.store.get_slang_terms(group_id, limit=12)
+        if not terms:
+            yield event.plain_result("还没学到啥黑话")
+            return
+        lines = []
+        for term in terms:
+            mark = "✓" if term.status == "confirmed" else "?"
+            meaning = term.meaning or "还不确定"
+            lines.append(f"{mark} {term.term}：{meaning}")
+        yield event.plain_result("\n".join(lines))
+
+    @iar.command("learn")
+    async def force_learn_slang(self, event: AstrMessageEvent):
+        """手动扫描当前群黑话。"""
+        group_id = self._event_group_id(event) or self.active_group_id
+        if not group_id or not self.store:
+            yield event.plain_result("还没观察到群")
+            return
+        updated = await self._refresh_slang(group_id, force=True)
+        if not updated:
+            yield event.plain_result("没学到新的")
+            return
+        yield event.plain_result("记了一点")
+
     @iar.command("reset")
     async def reset_group(self, event: AstrMessageEvent):
         """清空当前群的插件记忆。"""
@@ -466,6 +723,41 @@ class IAintNoRobot(Star):
             is_bot=False,
         )
 
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def observe_private(self, event: AstrMessageEvent):
+        """尝试把内线私信回复写回黑话记忆。"""
+        if not self.store or not bool(self.config.get("enable_insider", False)):
+            return
+        insider_qq = str(self.config.get("insider_qq", "")).strip()
+        if not insider_qq:
+            return
+        sender_id = str(safe_call(event, "get_sender_id") or "").strip()
+        if sender_id != insider_qq:
+            return
+        answer = compact_text(event.message_str or "", 240)
+        if not answer:
+            return
+        pending = self.store.get_pending_insider_questions(limit=1)
+        if not pending:
+            return
+        question = pending[0]
+        meaning = await self._condense_insider_answer(
+            question["group_id"],
+            question["term"],
+            answer,
+        )
+        if not meaning:
+            meaning = answer
+        self.store.upsert_slang(
+            question["group_id"],
+            question["term"],
+            meaning,
+            confidence=0.92,
+            status="confirmed",
+            source="insider",
+        )
+        self.store.mark_insider_answered(int(question["id"]))
+
     async def _background_loop(self) -> None:
         await asyncio.sleep(3)
         while True:
@@ -489,6 +781,7 @@ class IAintNoRobot(Star):
         self.active_group_id = group_id
 
         await self._maybe_refresh_summary(group_id)
+        await self._maybe_refresh_slang(group_id)
 
         state = self.store.get_state(group_id)
         if not state or not state.enabled:
@@ -542,6 +835,21 @@ class IAintNoRobot(Star):
             return
         await self._refresh_summary(group_id, force=False)
 
+    async def _maybe_refresh_slang(self, group_id: str) -> None:
+        if not bool(self.config.get("learn_slang", True)):
+            return
+        if not self.store:
+            return
+        interval = int(self.config.get("slang_scan_interval_minutes", 180)) * 60
+        if interval <= 0:
+            return
+        state = self.store.get_state(group_id)
+        if not state:
+            return
+        if int(time.time()) - state.last_slang_scanned_at < interval:
+            return
+        await self._refresh_slang(group_id, force=False)
+
     async def _refresh_summary(self, group_id: str, force: bool) -> bool:
         assert self.store is not None
         state = self.store.get_state(group_id)
@@ -577,6 +885,64 @@ class IAintNoRobot(Star):
         self.store.update_summary(group_id, style, topics)
         return True
 
+    async def _refresh_slang(self, group_id: str, force: bool) -> bool:
+        assert self.store is not None
+        if not bool(self.config.get("learn_slang", True)):
+            return False
+
+        state = self.store.get_state(group_id)
+        if not state:
+            return False
+        messages = self.store.get_recent_messages(group_id, 80)
+        human_messages = [m for m in messages if not int(m["is_bot"])]
+        if len(human_messages) < int(self.config.get("min_recent_messages", 6)) and not force:
+            return False
+
+        provider_id = await self._provider_id(state.unified_msg_origin)
+        if not provider_id:
+            return False
+
+        known_terms = self.store.get_slang_terms(group_id, limit=30)
+        prompt = build_slang_prompt(
+            messages=format_messages(messages[-60:]),
+            known_slang=format_slang_terms(known_terms),
+            has_visual_context=messages_mention_visual_context(messages),
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME} slang llm failed: {exc}")
+            return False
+        self.store.mark_slang_scanned(group_id)
+
+        parsed = parse_slang_items(resp.completion_text or "")
+        if not parsed:
+            return False
+
+        changed = False
+        for item in parsed:
+            status = "confirmed" if item["confidence"] >= 0.72 else "uncertain"
+            self.store.upsert_slang(
+                group_id=group_id,
+                term=item["term"],
+                meaning=item["meaning"],
+                confidence=item["confidence"],
+                status=status,
+                source="llm",
+            )
+            changed = True
+            if status == "uncertain":
+                await self._maybe_ask_insider_about_slang(
+                    group_id,
+                    item["term"],
+                    item["meaning"],
+                    messages[-20:],
+                )
+        return changed
+
     async def _generate_reply(self, group_id: str, force: bool) -> str | None:
         assert self.store is not None
         state = self.store.get_state(group_id)
@@ -589,12 +955,19 @@ class IAintNoRobot(Star):
 
         recent_limit = int(self.config.get("prompt_context_messages", 24))
         messages = self.store.get_recent_messages(group_id, recent_limit)
+        confirmed_slang = self.store.get_slang_terms(group_id, status="confirmed", limit=20)
+        uncertain_slang = self.store.get_slang_terms(group_id, status="uncertain", limit=20)
         prompt = build_reply_prompt(
             style_summary=state.style_summary,
             topic_summary=state.topic_summary,
+            confirmed_slang=format_slang_terms(confirmed_slang),
+            uncertain_slang=", ".join(term.term for term in uncertain_slang) or "无",
             messages=format_messages(messages),
             max_chars=int(self.config.get("max_reply_chars", 24)),
             extra_style_hint=str(self.config.get("extra_style_hint", "")).strip(),
+            allow_self_start=bool(self.config.get("allow_self_start", True)),
+            self_start_probability=float(self.config.get("self_start_probability", 0.18)),
+            self_start_examples=str(self.config.get("self_start_style_examples", "")).strip(),
             force=force,
         )
         try:
@@ -616,6 +989,117 @@ class IAintNoRobot(Star):
             ),
             recent_bot_messages=recent_bot,
         )
+
+    async def _maybe_ask_insider_about_slang(
+        self,
+        group_id: str,
+        term: str,
+        guessed_meaning: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        assert self.store is not None
+        if not bool(self.config.get("enable_insider", False)):
+            return
+        insider_qq = str(self.config.get("insider_qq", "")).strip()
+        if not insider_qq:
+            return
+
+        cooldown = int(self.config.get("insider_question_cooldown_minutes", 60)) * 60
+        last_asked_at = self.store.get_recent_insider_question(group_id, term)
+        if last_asked_at and int(time.time()) - last_asked_at < cooldown:
+            return
+
+        question = build_insider_question(
+            group_id=group_id,
+            term=term,
+            guessed_meaning=guessed_meaning,
+            messages=format_messages(messages),
+        )
+        self.store.add_insider_question(group_id, term, question)
+        sent = await self._send_private_message(insider_qq, question, group_id)
+        if not sent:
+            logger.info(f"{PLUGIN_NAME} queued insider question but private send failed: {term}")
+
+    async def _condense_insider_answer(self, group_id: str, term: str, answer: str) -> str | None:
+        assert self.store is not None
+        state = self.store.get_state(group_id)
+        if not state:
+            return None
+        provider_id = await self._provider_id(state.unified_msg_origin)
+        if not provider_id:
+            return None
+        prompt = build_insider_answer_prompt(term, answer)
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME} insider answer llm failed: {exc}")
+            return None
+        text = compact_text(resp.completion_text or "", 120)
+        if text.upper().startswith("SILENT"):
+            return None
+        return text.strip("\"'“”‘’` ")
+
+    async def _send_private_message(self, user_id: str, message: str, group_id: str) -> bool:
+        """Best-effort private send for QQ/OneBot-like adapters."""
+        candidates = [self.context]
+        platform_manager = getattr(self.context, "platform_manager", None)
+        if platform_manager is not None:
+            candidates.append(platform_manager)
+
+        if self.store:
+            state = self.store.get_state(group_id)
+            umo = state.unified_msg_origin if state else ""
+            for getter_name in ("get_platform_by_umo", "get_platform", "get_platform_inst"):
+                getter = getattr(platform_manager, getter_name, None) if platform_manager else None
+                if getter and umo:
+                    platform = await self._maybe_call(getter, umo)
+                    if platform is not None:
+                        candidates.append(platform)
+
+        user_arg = int(user_id) if user_id.isdigit() else user_id
+        for target in list(candidates):
+            for attr in ("send_private_msg", "send_private_message"):
+                method = getattr(target, attr, None)
+                if method and await self._try_call(method, user_id=user_arg, message=message):
+                    return True
+            for attr in ("call_api", "call_action"):
+                method = getattr(target, attr, None)
+                if not method:
+                    continue
+                attempts = (
+                    (("send_private_msg",), {"user_id": user_arg, "message": message}),
+                    (("send_private_msg", {"user_id": user_arg, "message": message}), {}),
+                    ((), {"action": "send_private_msg", "params": {"user_id": user_arg, "message": message}}),
+                    (("send_msg",), {"message_type": "private", "user_id": user_arg, "message": message}),
+                )
+                for args, kwargs in attempts:
+                    if await self._try_call(method, *args, **kwargs):
+                        return True
+        return False
+
+    async def _maybe_call(self, method: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            result = method(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except Exception:
+            return None
+
+    async def _try_call(self, method: Any, *args: Any, **kwargs: Any) -> bool:
+        try:
+            result = method(*args, **kwargs)
+            if inspect.isawaitable(result):
+                await result
+            return True
+        except TypeError:
+            return False
+        except Exception as exc:
+            logger.debug(f"{PLUGIN_NAME} adapter call failed: {exc}")
+            return False
 
     async def _send_to_group(self, group_id: str, text: str) -> None:
         assert self.store is not None
@@ -697,15 +1181,40 @@ def format_messages(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_slang_terms(terms: list[SlangTerm]) -> str:
+    if not terms:
+        return "无"
+    lines = []
+    for term in terms:
+        meaning = term.meaning or "不确定"
+        lines.append(f"{term.term}={meaning}")
+    return "；".join(lines)
+
+
+def messages_mention_visual_context(messages: list[dict[str, Any]]) -> bool:
+    markers = ("[图片]", "[CQ:image", "图片", "表情", "图", "截图")
+    return any(any(marker in str(msg.get("text", "")) for marker in markers) for msg in messages)
+
+
 def build_reply_prompt(
     style_summary: str,
     topic_summary: str,
+    confirmed_slang: str,
+    uncertain_slang: str,
     messages: str,
     max_chars: int,
     extra_style_hint: str,
+    allow_self_start: bool,
+    self_start_probability: float,
+    self_start_examples: str,
     force: bool,
 ) -> str:
     force_line = "这次是测试指令，可以更积极地给一句。" if force else "没必要就闭嘴。"
+    self_start_line = (
+        "如果没有可附和或可讨论的话题，可以低概率自创一句。"
+        if allow_self_start
+        else "如果没有可附和或可讨论的话题，必须 SILENT。"
+    )
     return f"""
 你要扮演一个普通群友，只能决定“现在是否接一句”。
 
@@ -721,8 +1230,16 @@ def build_reply_prompt(
 - 允许粗口和攻击性口吻，但要像群聊里顺嘴一句，别写成长篇吵架。
 - 不要使用群体歧视、现实威胁、泄露隐私这类内容。
 - 不要装懂游戏机制；不确定就 SILENT。
+- 不确定的黑话不要用；能看出大概但没确认，也别硬玩梗。
 - 语气可以轻微附和、吐槽、接梗，但不要抢话。
 - 人类群聊通常很省字，不要把一句话写完整得像作文。
+
+触发策略：
+- 优先看最近聊天里有没有可以附和、短评、轻微讨论的话题。
+- 有就贴着现有话题说一句，不要突然另起炉灶。
+- 没有可接话题时，再考虑自创一句。
+- 自创句子要以模糊感受、情绪或日常碎念开头，不要像通知。
+- 自创概率倾向：{self_start_probability:.2f}。{self_start_line}
 
 去 AI 味规则：
 - 少用“此外、值得注意、深入探讨、综上、从多个角度”。
@@ -733,13 +1250,42 @@ def build_reply_prompt(
 
 群话题记忆：{topic_summary or "暂无"}
 群语气记忆：{style_summary or "暂无"}
+已理解黑话：{confirmed_slang or "无"}
+不确定黑话，避开别用：{uncertain_slang or "无"}
 额外提示：{extra_style_hint or "无"}
 当前策略：{force_line}
+自创短句示例：
+{self_start_examples or "ok今天已到账五个大饼"}
 
 最近聊天：
 {messages or "暂无"}
 
 现在只输出 SILENT 或一句短句：
+""".strip()
+
+
+def build_slang_prompt(messages: str, known_slang: str, has_visual_context: bool) -> str:
+    visual_line = "最近可能有图片/表情包上下文，模型不能识图，不确定就降置信度。" if has_visual_context else "最近没有明显图片上下文。"
+    return f"""
+你在帮群聊插件学习这个群的黑话、缩写、梗词。
+
+要求：
+- 只提取这个群里可能有特殊含义的词，不要提取普通词。
+- 能从文本里确定含义才高置信度；不确定就低置信度。
+- 如果含义依赖图片、表情包、游戏机制、群内历史，不能硬猜。
+- 最多输出 5 条。
+- 没有发现就输出 NONE。
+- 不要 Markdown，不要解释。
+- 每行格式：词|含义|置信度
+- 置信度是 0 到 1 的小数。
+
+已知黑话：{known_slang or "无"}
+视觉上下文：{visual_line}
+
+最近聊天：
+{messages or "暂无"}
+
+现在输出：
 """.strip()
 
 
@@ -773,6 +1319,69 @@ def parse_summary(text: str) -> tuple[str, str]:
         elif line.startswith("语气"):
             style = line.split("：", 1)[-1].split(":", 1)[-1].strip()
     return style, topics
+
+
+def parse_slang_items(text: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip().strip("-* ")
+        if not line or line.upper().startswith("NONE"):
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) != 3:
+            continue
+        term, meaning, confidence_text = parts
+        term = compact_text(term, 40)
+        meaning = compact_text(meaning, 160)
+        if not term or not meaning:
+            continue
+        try:
+            confidence = float(confidence_text)
+        except ValueError:
+            confidence = 0.35
+        if confidence <= 0:
+            continue
+        items.append(
+            {
+                "term": term,
+                "meaning": meaning,
+                "confidence": max(0.0, min(1.0, confidence)),
+            }
+        )
+    return items[:5]
+
+
+def build_insider_question(
+    group_id: str,
+    term: str,
+    guessed_meaning: str,
+    messages: str,
+) -> str:
+    guess = guessed_meaning or "我不太确定"
+    return "\n".join(
+        [
+            f"群 {group_id} 里这个词我不太懂：{term}",
+            f"我猜是：{guess}",
+            "你方便就回一句它大概啥意思，不回也行。",
+            "最近几句：",
+            compact_text(messages, 360),
+        ]
+    )
+
+
+def build_insider_answer_prompt(term: str, answer: str) -> str:
+    return f"""
+把内线对黑话的解释压缩成一句短释义。
+
+要求：
+- 只输出释义，不要解释过程。
+- 最多 40 字。
+- 不要 Markdown。
+- 如果对方没回答含义，输出 SILENT。
+
+黑话：{term}
+内线回复：{answer}
+""".strip()
 
 
 def clean_reply(

@@ -16,7 +16,8 @@
     "default": 60
   },
   "min_attempt_interval_minutes": {
-    "description": "最短尝试插话间隔（分钟）",
+    "description": "最小发起发言周期（分钟）",
+    "hint": "后台每次触发前至少等待这么久。触发后仍会判断有没有可附和或可讨论的话题。",
     "type": "int",
     "default": 20
   },
@@ -60,6 +61,57 @@
     "type": "float",
     "hint": "0.0 到 1.0。原型建议低一点，避免太像机器人。",
     "default": 0.35
+  },
+  "allow_self_start": {
+    "description": "无可附和话题时允许自创一句",
+    "type": "bool",
+    "hint": "关闭后，没有可接的话题就沉默。开启后，会用模糊感受或情绪开头自创一句短话。",
+    "default": true
+  },
+  "self_start_probability": {
+    "description": "无话题时自创一句的概率",
+    "type": "float",
+    "hint": "0.0 到 1.0。建议很低，避免突然刷存在感。",
+    "default": 0.18
+  },
+  "self_start_style_examples": {
+    "description": "自创短句风格示例",
+    "type": "text",
+    "hint": "一行一个。用于提示模型用模糊感受或情绪开头，例如：ok今天已到账五个大饼",
+    "default": "ok今天已到账五个大饼\n有点绷不住了\n突然感觉今天像没睡醒"
+  },
+  "learn_slang": {
+    "description": "学习群聊黑话",
+    "type": "bool",
+    "default": true
+  },
+  "max_slang_terms": {
+    "description": "最多记忆多少条黑话",
+    "type": "int",
+    "default": 80
+  },
+  "slang_scan_interval_minutes": {
+    "description": "黑话学习扫描间隔（分钟）",
+    "type": "int",
+    "hint": "避免频繁调用 LLM。设置为 0 可关闭自动扫描，仍可通过 /iar summary 更新普通摘要。",
+    "default": 180
+  },
+  "enable_insider": {
+    "description": "启用内线询问",
+    "type": "bool",
+    "hint": "用于询问不确定黑话、游戏机制、图片/表情包上下文。接口不支持或内线不回时会自动避开。",
+    "default": false
+  },
+  "insider_qq": {
+    "description": "内线 QQ 号",
+    "type": "string",
+    "hint": "留空则不私信。当前优先尝试 OneBot/aiocqhttp 风格 send_private_msg。",
+    "default": ""
+  },
+  "insider_question_cooldown_minutes": {
+    "description": "内线询问冷却（分钟）",
+    "type": "int",
+    "default": 60
   },
   "summary_interval_minutes": {
     "description": "群语境记忆摘要更新间隔（分钟）",
