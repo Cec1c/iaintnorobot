@@ -89,9 +89,12 @@ self_start_style_examples
 handle_mentions
 mention_reply_max_chars
 stop_default_mention_reply
+mention_passthrough_patterns
 ```
 
 控制群内直接艾特。开启后，被艾特时会使用插件的人味短句回复；默认阻止 AstrBot 标准 LLM 回复，避免冒出一大段客服腔。
+
+这个插件的艾特处理器优先级较低，默认让其他插件先处理。`mention_passthrough_patterns` 是命令放行规则，一行一个正则；命中后本插件不回复也不阻断，例如 `/在线`、`重启服务器`。
 
 ```text
 learn_slang

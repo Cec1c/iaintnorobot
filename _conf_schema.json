@@ -102,6 +102,12 @@
     "hint": "建议开启。即使本插件没生成合适短句，也不继续走 AstrBot 默认标准回复。",
     "default": true
   },
+  "mention_passthrough_patterns": {
+    "description": "艾特放行规则",
+    "type": "text",
+    "hint": "一行一个正则。命中后不接管，让其他插件或 AstrBot 默认逻辑处理。例如 /在线、重启服务器。",
+    "default": "^[/.!！#]\\S*\n重启服务器\n^/?在线"
+  },
   "speak_probability": {
     "description": "通过本地规则后，真正请求 LLM 插话的概率",
     "type": "float",

@@ -749,7 +749,7 @@ class IAintNoRobot(Star):
         self.store.clear_group(group_id)
         yield event.plain_result("清了")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-100)
     async def handle_mention(self, event: AstrMessageEvent):
         """接管群内直接艾特，避免落到默认标准 LLM 回复。"""
         if (
@@ -768,10 +768,11 @@ class IAintNoRobot(Star):
         text = compact_text(event.message_str or "", 300)
         if not text or text.startswith("/iar"):
             return
+        if self._should_passthrough_mention(text):
+            return
 
         self._lock_active_group(group_id)
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
-        self._remember_event_message(group_id, event, text)
 
         reply = await self._generate_reply(
             group_id,
@@ -1294,6 +1295,22 @@ class IAintNoRobot(Star):
             return value
         return False
 
+    def _should_passthrough_mention(self, text: str) -> bool:
+        text = strip_mention_noise(text)
+        if not text:
+            return False
+        patterns = str(self.config.get("mention_passthrough_patterns", "")).splitlines()
+        for raw_pattern in patterns:
+            pattern = raw_pattern.strip()
+            if not pattern:
+                continue
+            try:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    return True
+            except re.error:
+                logger.warning(f"{PLUGIN_NAME} invalid mention passthrough pattern: {pattern}")
+        return False
+
     def _stop_event(self, event: AstrMessageEvent) -> None:
         for method_name in ("stop_event", "stop_propagation"):
             method = getattr(event, method_name, None)
@@ -1511,6 +1528,13 @@ def compact_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip()
+
+
+def strip_mention_noise(text: str) -> str:
+    text = str(text or "")
+    text = re.sub(r"\[CQ:at,qq=(?:all|\d+)\]", " ", text)
+    text = re.sub(r"@\S+", " ", text)
+    return compact_text(text, 300)
 
 
 def format_messages(messages: list[dict[str, Any]]) -> str:
