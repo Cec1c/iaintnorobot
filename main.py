@@ -1069,16 +1069,47 @@ class IAintNoRobot(Star):
         if last_asked_at and int(time.time()) - last_asked_at < cooldown:
             return
 
-        question = build_insider_question(
+        question = await self._generate_insider_question(
             group_id=group_id,
             term=term,
             guessed_meaning=guessed_meaning,
-            messages=format_messages(messages),
+            messages=messages,
         )
+        if not question:
+            return
         self.store.add_insider_question(group_id, term, question)
         sent = await self._send_private_message(insider_qq, question, group_id)
         if not sent:
             logger.info(f"{PLUGIN_NAME} queued insider question but private send failed: {term}")
+
+    async def _generate_insider_question(
+        self,
+        group_id: str,
+        term: str,
+        guessed_meaning: str,
+        messages: list[dict[str, Any]],
+    ) -> str | None:
+        assert self.store is not None
+        state = self.store.get_state(group_id)
+        if not state:
+            return None
+        provider_id = await self._provider_id(state.unified_msg_origin)
+        if not provider_id:
+            return None
+        prompt = build_insider_question_prompt(
+            term=term,
+            guessed_meaning=guessed_meaning,
+            messages=format_messages(messages),
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME} insider question llm failed: {exc}")
+            return None
+        return clean_private_message(resp.completion_text or "", max_chars=90)
 
     async def _condense_insider_answer(self, group_id: str, term: str, answer: str) -> str | None:
         assert self.store is not None
@@ -1458,6 +1489,7 @@ def build_reply_prompt(
 - 不要使用群体歧视、现实威胁、泄露隐私这类内容。
 - 不要装懂游戏机制；不确定就 SILENT。
 - 不确定的黑话不要用；能看出大概但没确认，也别硬玩梗。
+- 是否使用已理解黑话由你自己判断，不要为了用黑话而用黑话。
 - 语气可以轻微附和、吐槽、接梗，但不要抢话。
 - 人类群聊通常很省字，不要把一句话写完整得像作文。
 
@@ -1578,22 +1610,30 @@ def parse_slang_items(text: str) -> list[dict[str, Any]]:
     return items[:5]
 
 
-def build_insider_question(
-    group_id: str,
+def build_insider_question_prompt(
     term: str,
     guessed_meaning: str,
     messages: str,
 ) -> str:
-    guess = guessed_meaning or "我不太确定"
-    return "\n".join(
-        [
-            f"群 {group_id} 里这个词我不太懂：{term}",
-            f"我猜是：{guess}",
-            "你方便就回一句它大概啥意思，不回也行。",
-            "最近几句：",
-            compact_text(messages, 360),
-        ]
-    )
+    return f"""
+你要给一个熟人内线发私信，问一个群里的黑话是什么意思。
+
+要求：
+- 只输出要发给内线的一条私信。
+- 像真人随手问一句，不要像工单、报告、模板。
+- 最多 90 字。
+- 不要 Markdown，不要列表，不要解释自己是谁。
+- 可以提一下你猜的大概意思，但别装懂。
+- 语气随意，不需要礼貌过头；对方不回也没关系。
+
+不确定的词：{term}
+你目前猜测：{guessed_meaning or "不确定"}
+
+相关聊天：
+{messages or "暂无"}
+
+现在写这条私信：
+""".strip()
 
 
 def build_insider_answer_prompt(term: str, answer: str) -> str:
@@ -1609,6 +1649,25 @@ def build_insider_answer_prompt(term: str, answer: str) -> str:
 黑话：{term}
 内线回复：{answer}
 """.strip()
+
+
+def clean_private_message(raw_text: str, max_chars: int) -> str | None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+    text = text.splitlines()[0].strip()
+    text = re.sub(r"^(私信|消息|问题|输出)[:：]\s*", "", text).strip()
+    text = text.strip("\"'“”‘’` ")
+    if not text or text.upper().startswith("SILENT"):
+        return None
+    if MARKDOWN_OR_FORMAT.search(text):
+        return None
+    if len(text) > max_chars:
+        return None
+    normalized = text.lower().replace(" ", "")
+    if any(word in normalized for word in AI_SMELL_WORDS):
+        return None
+    return text
 
 
 def clean_reply(
