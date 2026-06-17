@@ -819,16 +819,25 @@ class IAintNoRobot(Star):
 
         self._lock_active_group(group_id)
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
+        if mention_text:
+            self._remember_event_message(group_id, event, mention_text)
 
-        scheduled = self._schedule_delayed_reply(
-            group_id,
-            mode="mention",
-            trigger_message=mention_text or "有人只艾特了你，没说别的",
-        )
+        reply = None
+        probability = float(self.config.get("mention_reply_probability", 1.0))
+        if random.random() <= max(0.0, min(1.0, probability)):
+            reply = await self._generate_reply(
+                group_id,
+                force=True,
+                mode="mention",
+                current_message=mention_text or "有人只艾特了你，没说别的",
+            )
+        if not reply:
+            reply = random.choice(("干嘛", "咋了", "说", "咋"))
+        yield event.plain_result(reply)
+        self.store.mark_spoke(group_id, reply)
+
         if bool(self.config.get("stop_default_mention_reply", True)):
             self._stop_event(event)
-        if not scheduled:
-            return
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def observe_group(self, event: AstrMessageEvent):
@@ -949,11 +958,6 @@ class IAintNoRobot(Star):
         existing = self.pending_reply_tasks.get(group_id)
         if existing and not existing.done():
             return True
-
-        if mode == "mention":
-            probability = float(self.config.get("mention_reply_probability", 0.75))
-            if random.random() > max(0.0, min(1.0, probability)):
-                return False
 
         delay = self._reply_delay_seconds()
         pending = PendingReply(

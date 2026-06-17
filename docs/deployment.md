@@ -100,7 +100,7 @@ mention_passthrough_patterns
 
 这个插件的艾特处理器优先级较低，默认让其他插件先处理。`mention_passthrough_patterns` 是命令放行规则，一行一个正则；命中后本插件不回复也不阻断，例如 `/在线`、`重启服务器`。
 
-触发后不会立刻回复，会在 `reply_delay_min_seconds` 到 `reply_delay_max_seconds` 之间随机等待。到点后会重新读取最新群聊；如果最近消息已经超过 `reply_stale_seconds`，就不回复旧话题。
+主动插话触发后不会立刻回复，会在 `reply_delay_min_seconds` 到 `reply_delay_max_seconds` 之间随机等待。到点后会重新读取最新群聊；如果最近消息已经超过 `reply_stale_seconds`，就不回复旧话题。直接艾特会立即短回，用来压住 AstrBot 默认标准回复。
 
 ```text
 continue_viewpoint

@@ -97,10 +97,10 @@
     "default": 36
   },
   "mention_reply_probability": {
-    "description": "艾特后实际回复概率",
+    "description": "艾特后使用 LLM 正常生成的概率",
     "type": "float",
-    "hint": "0.0 到 1.0。即使被艾特，也可以选择不回，避免每个人都回。",
-    "default": 0.75
+    "hint": "0.0 到 1.0。未命中时会用极短兜底短句，避免落回 AstrBot 默认标准回复。",
+    "default": 1.0
   },
   "reply_delay_min_seconds": {
     "description": "随机回复最短延迟（秒）",
