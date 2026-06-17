@@ -811,9 +811,10 @@ class IAintNoRobot(Star):
             return
 
         text = compact_text(event.message_str or "", 300)
-        if not text or text.startswith("/iar"):
+        mention_text = strip_mention_noise(text)
+        if mention_text.startswith("/iar"):
             return
-        if self._should_passthrough_mention(text):
+        if mention_text and self._should_passthrough_mention(mention_text):
             return
 
         self._lock_active_group(group_id)
@@ -822,7 +823,7 @@ class IAintNoRobot(Star):
         scheduled = self._schedule_delayed_reply(
             group_id,
             mode="mention",
-            trigger_message=text,
+            trigger_message=mention_text or "有人只艾特了你，没说别的",
         )
         if bool(self.config.get("stop_default_mention_reply", True)):
             self._stop_event(event)
@@ -990,14 +991,23 @@ class IAintNoRobot(Star):
         state = self.store.get_state(pending.group_id)
         if not state or not state.enabled or not self._is_group_allowed(pending.group_id):
             return
-        latest = self.store.get_latest_human_message(pending.group_id)
-        if not latest:
-            return
         now = int(time.time())
         stale_after = max(10, int(self.config.get("reply_stale_seconds", 150)))
-        if now - int(latest["created_at"]) > stale_after:
+
+        latest = self.store.get_latest_human_message(pending.group_id)
+        latest_text = pending.trigger_message
+        latest_created_at = pending.trigger_at
+        if latest:
+            candidate_created_at = int(latest["created_at"])
+            if pending.mode != "mention" or candidate_created_at >= pending.trigger_at:
+                latest_text = str(latest["text"] or pending.trigger_message)
+                latest_created_at = candidate_created_at
+        elif pending.mode != "mention":
             return
-        if state.last_spoke_at and int(latest["created_at"]) <= state.last_spoke_at:
+
+        if now - latest_created_at > stale_after:
+            return
+        if state.last_spoke_at and latest_created_at <= state.last_spoke_at:
             return
         if pending.mode != "mention":
             speak_gap = int(self.config.get("min_speak_interval_minutes", 45)) * 60
@@ -1008,7 +1018,7 @@ class IAintNoRobot(Star):
             pending.group_id,
             force=pending.mode == "mention",
             mode=pending.mode,
-            current_message=str(latest["text"] or pending.trigger_message),
+            current_message=latest_text,
         )
         if text:
             await self._send_to_group(pending.group_id, text)
