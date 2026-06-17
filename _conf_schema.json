@@ -96,6 +96,28 @@
     "type": "int",
     "default": 36
   },
+  "mention_reply_probability": {
+    "description": "艾特后实际回复概率",
+    "type": "float",
+    "hint": "0.0 到 1.0。即使被艾特，也可以选择不回，避免每个人都回。",
+    "default": 0.75
+  },
+  "reply_delay_min_seconds": {
+    "description": "随机回复最短延迟（秒）",
+    "type": "int",
+    "default": 3
+  },
+  "reply_delay_max_seconds": {
+    "description": "随机回复最长延迟（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "reply_stale_seconds": {
+    "description": "待回复过期时间（秒）",
+    "type": "int",
+    "hint": "延迟结束后，如果最近消息已经太久远，就不回复旧话题。",
+    "default": 150
+  },
   "stop_default_mention_reply": {
     "description": "艾特时阻止默认 LLM 回复",
     "type": "bool",
@@ -113,6 +135,12 @@
     "type": "float",
     "hint": "0.0 到 1.0。原型建议低一点，避免太像机器人。",
     "default": 0.35
+  },
+  "continue_viewpoint": {
+    "description": "延续自己的表达线索",
+    "type": "bool",
+    "hint": "开启后会记住自己最近想表达的意思，避免每次回复都散开。",
+    "default": true
   },
   "allow_self_start": {
     "description": "无可附和话题时允许自创一句",

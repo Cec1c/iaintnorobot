@@ -88,6 +88,10 @@ self_start_style_examples
 ```text
 handle_mentions
 mention_reply_max_chars
+mention_reply_probability
+reply_delay_min_seconds
+reply_delay_max_seconds
+reply_stale_seconds
 stop_default_mention_reply
 mention_passthrough_patterns
 ```
@@ -95,6 +99,14 @@ mention_passthrough_patterns
 控制群内直接艾特。开启后，被艾特时会使用插件的人味短句回复；默认阻止 AstrBot 标准 LLM 回复，避免冒出一大段客服腔。
 
 这个插件的艾特处理器优先级较低，默认让其他插件先处理。`mention_passthrough_patterns` 是命令放行规则，一行一个正则；命中后本插件不回复也不阻断，例如 `/在线`、`重启服务器`。
+
+触发后不会立刻回复，会在 `reply_delay_min_seconds` 到 `reply_delay_max_seconds` 之间随机等待。到点后会重新读取最新群聊；如果最近消息已经超过 `reply_stale_seconds`，就不回复旧话题。
+
+```text
+continue_viewpoint
+```
+
+控制表达线索记忆。开启后，机器人会压缩自己最近想表达的态度，下一次短句可以顺着这个方向，不至于每条都散开。
 
 ```text
 learn_slang

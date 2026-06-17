@@ -82,6 +82,7 @@ class GroupState:
     last_slang_scanned_at: int
     style_summary: str
     topic_summary: str
+    viewpoint_summary: str
 
 
 @dataclass
@@ -92,6 +93,15 @@ class SlangTerm:
     status: str
     source: str
     updated_at: int
+
+
+@dataclass
+class PendingReply:
+    group_id: str
+    mode: str
+    trigger_message: str
+    trigger_at: int
+    run_at: int
 
 
 class MemoryStore:
@@ -116,11 +126,13 @@ class MemoryStore:
                     last_summarized_at integer not null default 0,
                     last_slang_scanned_at integer not null default 0,
                     style_summary text not null default '',
-                    topic_summary text not null default ''
+                    topic_summary text not null default '',
+                    viewpoint_summary text not null default ''
                 )
                 """
             )
             self._ensure_column(conn, "group_state", "last_slang_scanned_at", "integer not null default 0")
+            self._ensure_column(conn, "group_state", "viewpoint_summary", "text not null default ''")
             conn.execute(
                 """
                 create table if not exists recent_messages (
@@ -304,6 +316,13 @@ class MemoryStore:
                 ),
             )
 
+    def update_viewpoint(self, group_id: str, viewpoint_summary: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "update group_state set viewpoint_summary = ? where group_id = ?",
+                (compact_text(viewpoint_summary, 240), group_id),
+            )
+
     def mark_slang_scanned(self, group_id: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -467,6 +486,20 @@ class MemoryStore:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def get_latest_human_message(self, group_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                select sender_id, sender_name, text, created_at, is_bot
+                from recent_messages
+                where group_id = ? and is_bot = 0
+                order by id desc
+                limit 1
+                """,
+                (group_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def count_recent_human_messages(self, group_id: str, since_ts: int) -> int:
         with self._connect() as conn:
             row = conn.execute(
@@ -491,7 +524,8 @@ class MemoryStore:
                     last_summarized_at = 0,
                     last_slang_scanned_at = 0,
                     style_summary = '',
-                    topic_summary = ''
+                    topic_summary = '',
+                    viewpoint_summary = ''
                 where group_id = ?
                 """,
                 (group_id,),
@@ -540,16 +574,18 @@ class MemoryStore:
             last_slang_scanned_at=int(row["last_slang_scanned_at"]),
             style_summary=str(row["style_summary"] or ""),
             topic_summary=str(row["topic_summary"] or ""),
+            viewpoint_summary=str(row["viewpoint_summary"] or ""),
         )
 
 
-@register(PLUGIN_NAME, "15185", "单群低频自然插话原型", "0.2.0")
+@register(PLUGIN_NAME, "15185", "单群低频自然插话原型", "0.3.0")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
         self.store: MemoryStore | None = None
         self.worker_task: asyncio.Task | None = None
+        self.pending_reply_tasks: dict[str, asyncio.Task] = {}
         self.active_group_id = str(self.config.get("target_group_id", "")).strip()
         self._register_page_apis(context)
 
@@ -572,6 +608,14 @@ class IAintNoRobot(Star):
                 await self.worker_task
             except asyncio.CancelledError:
                 pass
+        for task in self.pending_reply_tasks.values():
+            task.cancel()
+        for task in self.pending_reply_tasks.values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.pending_reply_tasks.clear()
 
     @filter.command_group("iar")
     def iar(self):
@@ -606,6 +650,7 @@ class IAintNoRobot(Star):
                     f"下次尝试：{human_delta(max(0, state.next_attempt_at - now))}",
                     f"话题记忆：{state.topic_summary or '还没有'}",
                     f"语气记忆：{state.style_summary or '还没有'}",
+                    f"表达线索：{state.viewpoint_summary or '还没有'}",
                 ]
             )
         )
@@ -774,18 +819,15 @@ class IAintNoRobot(Star):
         self._lock_active_group(group_id)
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
 
-        reply = await self._generate_reply(
+        scheduled = self._schedule_delayed_reply(
             group_id,
-            force=True,
             mode="mention",
-            current_message=text,
+            trigger_message=text,
         )
         if bool(self.config.get("stop_default_mention_reply", True)):
             self._stop_event(event)
-
-        if reply:
-            yield event.plain_result(reply)
-            self.store.mark_spoke(group_id, reply)
+        if not scheduled:
+            return
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def observe_group(self, event: AstrMessageEvent):
@@ -889,9 +931,87 @@ class IAintNoRobot(Star):
         if random.random() > max(0.0, min(1.0, probability)):
             return
 
-        text = await self._generate_reply(group_id, force=False)
+        self._schedule_delayed_reply(
+            group_id,
+            mode="ambient",
+            trigger_message="",
+        )
+
+    def _schedule_delayed_reply(
+        self,
+        group_id: str,
+        mode: str,
+        trigger_message: str,
+    ) -> bool:
+        if not self.store:
+            return False
+        existing = self.pending_reply_tasks.get(group_id)
+        if existing and not existing.done():
+            return True
+
+        if mode == "mention":
+            probability = float(self.config.get("mention_reply_probability", 0.75))
+            if random.random() > max(0.0, min(1.0, probability)):
+                return False
+
+        delay = self._reply_delay_seconds()
+        pending = PendingReply(
+            group_id=group_id,
+            mode=mode,
+            trigger_message=trigger_message,
+            trigger_at=int(time.time()),
+            run_at=int(time.time()) + delay,
+        )
+        task = asyncio.create_task(self._delayed_reply_worker(pending, delay))
+        self.pending_reply_tasks[group_id] = task
+        return True
+
+    def _reply_delay_seconds(self) -> int:
+        min_s = max(0, int(self.config.get("reply_delay_min_seconds", 3)))
+        max_s = max(min_s, int(self.config.get("reply_delay_max_seconds", 120)))
+        return random.randint(min_s, max_s)
+
+    async def _delayed_reply_worker(self, pending: PendingReply, delay: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self._run_pending_reply(pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME} delayed reply failed: {exc}")
+        finally:
+            current = self.pending_reply_tasks.get(pending.group_id)
+            if current is asyncio.current_task():
+                self.pending_reply_tasks.pop(pending.group_id, None)
+
+    async def _run_pending_reply(self, pending: PendingReply) -> None:
+        if not self.store:
+            return
+        state = self.store.get_state(pending.group_id)
+        if not state or not state.enabled or not self._is_group_allowed(pending.group_id):
+            return
+        latest = self.store.get_latest_human_message(pending.group_id)
+        if not latest:
+            return
+        now = int(time.time())
+        stale_after = max(10, int(self.config.get("reply_stale_seconds", 150)))
+        if now - int(latest["created_at"]) > stale_after:
+            return
+        if state.last_spoke_at and int(latest["created_at"]) <= state.last_spoke_at:
+            return
+        if pending.mode != "mention":
+            speak_gap = int(self.config.get("min_speak_interval_minutes", 45)) * 60
+            if state.last_spoke_at and now - state.last_spoke_at < speak_gap:
+                return
+
+        text = await self._generate_reply(
+            pending.group_id,
+            force=pending.mode == "mention",
+            mode=pending.mode,
+            current_message=str(latest["text"] or pending.trigger_message),
+        )
         if text:
-            await self._send_to_group(group_id, text)
+            await self._send_to_group(pending.group_id, text)
 
     def _local_gate_allows(self, state: GroupState) -> bool:
         assert self.store is not None
@@ -1056,6 +1176,9 @@ class IAintNoRobot(Star):
         prompt = build_reply_prompt(
             style_summary=state.style_summary,
             topic_summary=state.topic_summary,
+            viewpoint_summary=state.viewpoint_summary
+            if bool(self.config.get("continue_viewpoint", True))
+            else "",
             confirmed_slang=format_slang_terms(confirmed_slang),
             uncertain_slang=", ".join(term.term for term in uncertain_slang) or "无",
             messages=format_messages(messages),
@@ -1237,7 +1360,35 @@ class IAintNoRobot(Star):
             return
         await self.context.send_message(state.unified_msg_origin, MessageChain().message(text))
         self.store.mark_spoke(group_id, text)
+        await self._refresh_viewpoint(group_id)
         self._schedule_next_attempt(group_id)
+
+    async def _refresh_viewpoint(self, group_id: str) -> None:
+        assert self.store is not None
+        if not bool(self.config.get("continue_viewpoint", True)):
+            return
+        state = self.store.get_state(group_id)
+        if not state:
+            return
+        provider_id = await self._provider_id(state.unified_msg_origin)
+        if not provider_id:
+            return
+        messages = self.store.get_recent_messages(group_id, 40)
+        prompt = build_viewpoint_prompt(
+            old_viewpoint=state.viewpoint_summary,
+            messages=format_messages(messages),
+        )
+        try:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME} viewpoint llm failed: {exc}")
+            return
+        viewpoint = compact_text(resp.completion_text or "", 160).strip("\"'“”‘’` ")
+        if viewpoint and not viewpoint.upper().startswith("SILENT"):
+            self.store.update_viewpoint(group_id, viewpoint)
 
     async def _provider_id(self, umo: str) -> str | None:
         try:
@@ -1565,6 +1716,7 @@ def messages_mention_visual_context(messages: list[dict[str, Any]]) -> bool:
 def build_reply_prompt(
     style_summary: str,
     topic_summary: str,
+    viewpoint_summary: str,
     confirmed_slang: str,
     uncertain_slang: str,
     messages: str,
@@ -1624,6 +1776,8 @@ def build_reply_prompt(
 - 自创概率倾向：{self_start_probability:.2f}。{self_start_line}
 - 如果是被直接艾特：不用自创，贴着对方这句话回；能一句话解决就别扩展。
 - 如果对方只是叫你名字或戳一下，可以回得很懒，比如“干嘛”“咋了”“说”这类感觉，但不要固定复读。
+- 如果你最近有表达线索，可以顺着它继续，但这一条仍然只能短。
+- 真人可以几次短句慢慢表达一个意思，不要在单条里把观点讲完。
 
 去 AI 味规则：
 - 少用“此外、值得注意、深入探讨、综上、从多个角度”。
@@ -1634,6 +1788,7 @@ def build_reply_prompt(
 
 群话题记忆：{topic_summary or "暂无"}
 群语气记忆：{style_summary or "暂无"}
+你最近想表达的线索：{viewpoint_summary or "暂无"}
 已理解黑话：{confirmed_slang or "无"}
 不确定黑话，避开别用：{uncertain_slang or "无"}
 额外提示：{extra_style_hint or "无"}
@@ -1646,6 +1801,26 @@ def build_reply_prompt(
 {messages or "暂无"}
 
 现在只输出 SILENT 或一句短句：
+""".strip()
+
+
+def build_viewpoint_prompt(old_viewpoint: str, messages: str) -> str:
+    return f"""
+你在维护一个群友的内部表达线索，让他说话别每次都散开。
+
+要求：
+- 只总结“我最近大概想表达什么态度/观点/情绪”。
+- 最多 50 字。
+- 不要写成长句，不要 Markdown。
+- 如果没有连续观点，只保留轻微情绪或输出 SILENT。
+- 这是内部记忆，不是发到群里的话。
+
+旧线索：{old_viewpoint or "暂无"}
+
+最近聊天：
+{messages or "暂无"}
+
+现在输出新的表达线索：
 """.strip()
 
 
