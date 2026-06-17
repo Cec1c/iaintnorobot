@@ -32,10 +32,18 @@ astrbot_plugin_i_aint_no_robot/
 推荐先只配置一个群：
 
 ```text
-target_group_id = 目标群号
+managed_groups = 已添加群聊
+target_group_id = 当前选择的目标群号
 ```
 
-如果留空，插件会自动锁定第一个观察到的群。
+推荐在 AstrBot WebUI 的插件配置面板里先添加群聊，再到插件详情页的“群聊选择”页面用下拉框选择目标群。下拉框只显示已添加且启用的群聊。
+
+也可以在目标群里使用：
+
+```text
+/iar addgroup
+/iar select 群号
+```
 
 原型阶段建议保持低频：
 
@@ -55,7 +63,13 @@ speak_probability = 0.35
 target_group_id
 ```
 
-目标群号。当前原型只服务一个群。
+当前选择的目标群号。应来自 `managed_groups`。
+
+```text
+managed_groups
+```
+
+已添加群聊列表。插件只会在这里添加且启用的群聊中运行。
 
 ```text
 min_attempt_interval_minutes
@@ -93,6 +107,9 @@ insider_question_cooldown_minutes
 /iar status   查看状态
 /iar on       开启当前群
 /iar off      关闭当前群
+/iar addgroup 把当前群加入 WebUI 可选群聊
+/iar groups   查看已添加群聊
+/iar select   选择已添加群聊作为目标
 /iar say      强制尝试生成一句，方便测试
 /iar summary  手动刷新群语境记忆
 /iar slang    查看黑话记忆

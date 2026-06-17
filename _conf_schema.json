@@ -4,10 +4,39 @@
     "type": "bool",
     "default": true
   },
+  "managed_groups": {
+    "description": "已添加群聊",
+    "type": "template_list",
+    "hint": "插件只会在这里添加的群聊中运行。可在插件详情页的“群聊选择”页面用下拉框选择目标群。",
+    "templates": {
+      "group": {
+        "name": "群聊",
+        "display_item": "name",
+        "items": {
+          "group_id": {
+            "description": "群号",
+            "type": "string",
+            "default": ""
+          },
+          "name": {
+            "description": "显示名称",
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "description": "允许作为目标群",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "target_group_id": {
-    "description": "目标群号",
+    "description": "当前选择的目标群号",
     "type": "string",
-    "hint": "留空时自动锁定第一个观察到的群。当前原型只服务一个群。",
+    "hint": "应来自“已添加群聊”。推荐在插件详情页的“群聊选择”页面选择，避免手填。",
     "default": ""
   },
   "scan_interval_seconds": {

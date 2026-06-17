@@ -15,6 +15,13 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 try:
+    from astrbot.api.web import error_response, json_response, request as web_request
+except Exception:  # pragma: no cover - Pages are optional on older AstrBot versions.
+    error_response = None
+    json_response = None
+    web_request = None
+
+try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 except Exception:  # pragma: no cover - only used on old AstrBot versions.
     get_astrbot_data_path = None
@@ -544,6 +551,7 @@ class IAintNoRobot(Star):
         self.store: MemoryStore | None = None
         self.worker_task: asyncio.Task | None = None
         self.active_group_id = str(self.config.get("target_group_id", "")).strip()
+        self._register_page_apis(context)
 
     async def initialize(self) -> None:
         data_dir = self._plugin_data_dir()
@@ -551,7 +559,8 @@ class IAintNoRobot(Star):
         max_slang_terms = int(self.config.get("max_slang_terms", 80))
         self.store = MemoryStore(data_dir / "memory.sqlite3", recent_limit, max_slang_terms)
         self.store.initialize()
-        if not self.active_group_id:
+        self.active_group_id = self._selected_group_id()
+        if not self.active_group_id and not self._managed_groups():
             self.active_group_id = self.store.get_first_group_id() or ""
         self.worker_task = asyncio.create_task(self._background_loop())
         logger.info(f"{PLUGIN_NAME} initialized, data_dir={data_dir}")
@@ -588,6 +597,7 @@ class IAintNoRobot(Star):
             "\n".join(
                 [
                     f"群：{group_id}",
+                    f"已添加群：{'是' if self._is_group_allowed(group_id) else '否'}",
                     f"开关：{'开' if state.enabled else '关'}",
                     f"短期消息：{stats['messages']} 条",
                     f"机器人发过：{stats['bot_messages']} 条",
@@ -607,6 +617,12 @@ class IAintNoRobot(Star):
         if not group_id or not self.store:
             yield event.plain_result("只能在群里用")
             return
+        self._ensure_managed_group(
+            group_id,
+            safe_call(event, "get_group_name") or f"群 {group_id}",
+            enabled=True,
+        )
+        await self._save_config()
         self._lock_active_group(group_id)
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
         self.store.set_enabled(group_id, True)
@@ -621,6 +637,45 @@ class IAintNoRobot(Star):
             return
         self.store.set_enabled(group_id, False)
         yield event.plain_result("关了")
+
+    @iar.command("addgroup")
+    async def add_group(self, event: AstrMessageEvent):
+        """把当前群加入 WebUI 可选群聊。"""
+        group_id = self._event_group_id(event)
+        if not group_id:
+            yield event.plain_result("只能在群里用")
+            return
+        name = safe_call(event, "get_group_name") or f"群 {group_id}"
+        added = self._ensure_managed_group(group_id, name, enabled=True)
+        await self._save_config()
+        yield event.plain_result("加好了" if added else "已经在列表里了")
+
+    @iar.command("groups")
+    async def list_groups(self, event: AstrMessageEvent):
+        """查看 WebUI 已添加群聊。"""
+        groups = self._managed_groups(include_disabled=True)
+        if not groups:
+            yield event.plain_result("还没添加群聊")
+            return
+        selected = self._selected_group_id()
+        lines = []
+        for group in groups:
+            mark = "*" if group["group_id"] == selected else "-"
+            enabled = "开" if group["enabled"] else "关"
+            lines.append(f"{mark} {group['name']} / {group['group_id']} / {enabled}")
+        yield event.plain_result("\n".join(lines))
+
+    @iar.command("select")
+    async def select_group(self, event: AstrMessageEvent, group_id: str):
+        """选择目标群号，必须来自已添加群聊。"""
+        group_id = str(group_id).strip()
+        if not self._managed_group_exists(group_id, enabled_only=True):
+            yield event.plain_result("这个群没添加，先 /iar addgroup")
+            return
+        self.config["target_group_id"] = group_id
+        self.active_group_id = group_id
+        await self._save_config()
+        yield event.plain_result("选好了")
 
     @iar.command("say")
     async def force_say(self, event: AstrMessageEvent):
@@ -706,6 +761,8 @@ class IAintNoRobot(Star):
 
         if self.active_group_id and group_id != self.active_group_id:
             return
+        if not self._is_group_allowed(group_id):
+            return
         self._lock_active_group(group_id)
 
         text = compact_text(event.message_str or "", 300)
@@ -777,6 +834,9 @@ class IAintNoRobot(Star):
 
         group_id = self.active_group_id or self.store.get_first_group_id()
         if not group_id:
+            return
+        if not self._is_group_allowed(group_id):
+            self.active_group_id = self._selected_group_id()
             return
         self.active_group_id = group_id
 
@@ -1135,6 +1195,173 @@ class IAintNoRobot(Star):
         next_at = int(time.time()) + random.randint(min_min * 60, max_min * 60)
         self.store.set_next_attempt(group_id, next_at)
 
+    def _register_page_apis(self, context: Context) -> None:
+        register_api = getattr(context, "register_web_api", None)
+        if not register_api or not json_response:
+            return
+        routes = (
+            ("/iar/groups", self._api_groups, ["GET"]),
+            ("/iar/groups/add", self._api_add_group, ["POST"]),
+            ("/iar/groups/select", self._api_select_group, ["POST"]),
+            ("/iar/groups/remove", self._api_remove_group, ["POST"]),
+        )
+        for path, handler, methods in routes:
+            try:
+                register_api(path, handler, methods=methods)
+            except TypeError:
+                try:
+                    register_api(path, handler)
+                except Exception as exc:
+                    logger.debug(f"{PLUGIN_NAME} web api register failed {path}: {exc}")
+            except Exception as exc:
+                logger.debug(f"{PLUGIN_NAME} web api register failed {path}: {exc}")
+
+    async def _api_groups(self, *args: Any):
+        return json_response(
+            {
+                "selected": self._selected_group_id(),
+                "groups": self._managed_groups(include_disabled=True),
+            }
+        )
+
+    async def _api_add_group(self, *args: Any):
+        payload = await self._request_json(args[0] if args else None)
+        group_id = compact_text(payload.get("group_id", ""), 40)
+        name = compact_text(payload.get("name", ""), 80) or f"群 {group_id}"
+        if not group_id:
+            return self._web_error("群号不能为空")
+        self._ensure_managed_group(group_id, name, enabled=True)
+        await self._save_config()
+        return json_response({"ok": True, "groups": self._managed_groups(include_disabled=True)})
+
+    async def _api_select_group(self, *args: Any):
+        payload = await self._request_json(args[0] if args else None)
+        group_id = compact_text(payload.get("group_id", ""), 40)
+        if not self._managed_group_exists(group_id, enabled_only=True):
+            return self._web_error("只能选择已添加且启用的群聊")
+        self.config["target_group_id"] = group_id
+        self.active_group_id = group_id
+        await self._save_config()
+        return json_response({"ok": True, "selected": group_id})
+
+    async def _api_remove_group(self, *args: Any):
+        payload = await self._request_json(args[0] if args else None)
+        group_id = compact_text(payload.get("group_id", ""), 40)
+        groups = [
+            group
+            for group in self._managed_groups(include_disabled=True)
+            if group["group_id"] != group_id
+        ]
+        self.config["managed_groups"] = groups
+        if str(self.config.get("target_group_id", "")).strip() == group_id:
+            self.config["target_group_id"] = ""
+            self.active_group_id = self._first_enabled_managed_group_id()
+        await self._save_config()
+        return json_response(
+            {
+                "ok": True,
+                "selected": self._selected_group_id(),
+                "groups": self._managed_groups(include_disabled=True),
+            }
+        )
+
+    async def _request_json(self, req: Any = None) -> dict[str, Any]:
+        target = req or web_request
+        if not target:
+            return {}
+        try:
+            json_method = getattr(target, "json", None)
+            if not json_method:
+                return {}
+            payload = json_method()
+            if inspect.isawaitable(payload):
+                payload = await payload
+        except Exception:
+            payload = {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _web_error(self, message: str):
+        if error_response:
+            return error_response(message)
+        return json_response({"ok": False, "message": message})
+
+    def _managed_groups(self, include_disabled: bool = False) -> list[dict[str, Any]]:
+        raw_groups = self.config.get("managed_groups", [])
+        if not isinstance(raw_groups, list):
+            return []
+        groups: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in raw_groups:
+            if not isinstance(raw, dict):
+                continue
+            group_id = compact_text(raw.get("group_id", ""), 40)
+            if not group_id or group_id in seen:
+                continue
+            enabled = bool(raw.get("enabled", True))
+            if not include_disabled and not enabled:
+                continue
+            name = compact_text(raw.get("name", ""), 80) or f"群 {group_id}"
+            groups.append({"group_id": group_id, "name": name, "enabled": enabled})
+            seen.add(group_id)
+        return groups
+
+    def _managed_group_exists(self, group_id: str, enabled_only: bool = False) -> bool:
+        group_id = str(group_id).strip()
+        return any(
+            group["group_id"] == group_id and (group["enabled"] or not enabled_only)
+            for group in self._managed_groups(include_disabled=True)
+        )
+
+    def _ensure_managed_group(self, group_id: str, name: str, enabled: bool) -> bool:
+        groups = self._managed_groups(include_disabled=True)
+        for group in groups:
+            if group["group_id"] == group_id:
+                group["name"] = group["name"] or name or f"群 {group_id}"
+                group["enabled"] = group["enabled"] or enabled
+                self.config["managed_groups"] = groups
+                return False
+        groups.append(
+            {
+                "group_id": group_id,
+                "name": name or f"群 {group_id}",
+                "enabled": enabled,
+            }
+        )
+        self.config["managed_groups"] = groups
+        return True
+
+    def _first_enabled_managed_group_id(self) -> str:
+        groups = self._managed_groups(include_disabled=False)
+        return groups[0]["group_id"] if groups else ""
+
+    def _selected_group_id(self) -> str:
+        configured = str(self.config.get("target_group_id", "")).strip()
+        if self._managed_groups(include_disabled=True):
+            if self._managed_group_exists(configured, enabled_only=True):
+                return configured
+            return self._first_enabled_managed_group_id()
+        return configured
+
+    def _is_group_allowed(self, group_id: str) -> bool:
+        group_id = str(group_id).strip()
+        if not group_id:
+            return False
+        if self._managed_groups(include_disabled=True):
+            return self._managed_group_exists(group_id, enabled_only=True)
+        configured = str(self.config.get("target_group_id", "")).strip()
+        return not configured or group_id == configured
+
+    async def _save_config(self) -> None:
+        save = getattr(self.config, "save_config", None)
+        if not save:
+            return
+        try:
+            result = save()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(f"{PLUGIN_NAME} config save failed: {exc}")
+
     def _plugin_data_dir(self) -> Path:
         if get_astrbot_data_path:
             root = Path(get_astrbot_data_path())
@@ -1146,8 +1373,8 @@ class IAintNoRobot(Star):
         return str(getattr(event.message_obj, "group_id", "") or "")
 
     def _lock_active_group(self, group_id: str) -> None:
-        configured = str(self.config.get("target_group_id", "")).strip()
-        self.active_group_id = configured or group_id
+        selected = self._selected_group_id()
+        self.active_group_id = selected or group_id
 
     def _message_attr(self, event: AstrMessageEvent, obj_name: str, attr_name: str) -> Any:
         obj = getattr(event.message_obj, obj_name, None)

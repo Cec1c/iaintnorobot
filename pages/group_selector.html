@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>群聊选择</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+
+      main {
+        max-width: 720px;
+      }
+
+      h1 {
+        margin: 0 0 18px;
+        font-size: 22px;
+      }
+
+      label {
+        display: block;
+        margin: 16px 0 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      select,
+      input {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 480px;
+        height: 36px;
+        padding: 0 10px;
+        border: 1px solid #9ca3af;
+        border-radius: 6px;
+        background: transparent;
+        font: inherit;
+      }
+
+      button {
+        height: 34px;
+        padding: 0 12px;
+        border: 1px solid #6b7280;
+        border-radius: 6px;
+        background: transparent;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: end;
+        margin-top: 8px;
+      }
+
+      .field {
+        min-width: 180px;
+        flex: 1;
+      }
+
+      .actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .status {
+        margin-top: 14px;
+        min-height: 22px;
+        color: #4b5563;
+      }
+
+      .list {
+        margin-top: 20px;
+        padding: 0;
+        list-style: none;
+      }
+
+      .list li {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        padding: 10px 0;
+        border-top: 1px solid #d1d5db;
+      }
+
+      .muted {
+        color: #6b7280;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>群聊选择</h1>
+
+      <label for="groupSelect">当前目标群</label>
+      <select id="groupSelect"></select>
+      <div class="actions">
+        <button id="saveBtn" type="button">保存选择</button>
+        <button id="refreshBtn" type="button">刷新</button>
+      </div>
+
+      <div class="row">
+        <div class="field">
+          <label for="groupId">添加群号</label>
+          <input id="groupId" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="groupName">显示名称</label>
+          <input id="groupName" autocomplete="off" />
+        </div>
+        <button id="addBtn" type="button">添加</button>
+      </div>
+
+      <div id="status" class="status"></div>
+      <ul id="groupList" class="list"></ul>
+    </main>
+
+    <script>
+      const endpointCandidates = [
+        "/api/plugin/iar",
+        "/api/plugins/iar",
+        "/api/plugin/astrbot_plugin_i_aint_no_robot/iar",
+        "/api/plugins/astrbot_plugin_i_aint_no_robot/iar",
+        "/iar",
+      ];
+
+      let apiBase = endpointCandidates[0];
+
+      const statusEl = document.getElementById("status");
+      const selectEl = document.getElementById("groupSelect");
+      const listEl = document.getElementById("groupList");
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      async function request(url, options = {}) {
+        const response = await fetch(url, {
+          headers: { "Content-Type": "application/json" },
+          ...options,
+        });
+        if (!response.ok) throw new Error(await response.text());
+        return response.json();
+      }
+
+      function render(data) {
+        const groups = data.groups || [];
+        selectEl.innerHTML = "";
+        listEl.innerHTML = "";
+
+        if (!groups.length) {
+          const option = document.createElement("option");
+          option.textContent = "还没有添加群聊";
+          option.value = "";
+          selectEl.appendChild(option);
+          return;
+        }
+
+        for (const group of groups) {
+          if (group.enabled) {
+            const option = document.createElement("option");
+            option.value = group.group_id;
+            option.textContent = `${group.name} / ${group.group_id}`;
+            option.selected = group.group_id === data.selected;
+            selectEl.appendChild(option);
+          }
+
+          const item = document.createElement("li");
+          const title = document.createElement("div");
+          title.innerHTML = `<strong>${group.name}</strong><div class="muted">${group.group_id}</div>`;
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.textContent = "移除";
+          remove.onclick = () => removeGroup(group.group_id);
+          item.append(title, remove);
+          listEl.appendChild(item);
+        }
+      }
+
+      async function load() {
+        try {
+          const data = await loadGroups();
+          render(data);
+          setStatus("已加载");
+        } catch (error) {
+          setStatus(`加载失败：${error.message}`);
+        }
+      }
+
+      async function saveSelected() {
+        if (!selectEl.value) return setStatus("没有可选群聊");
+        try {
+          await request(`${apiBase}/groups/select`, {
+            method: "POST",
+            body: JSON.stringify({ group_id: selectEl.value }),
+          });
+          setStatus("已保存");
+        } catch (error) {
+          setStatus(`保存失败：${error.message}`);
+        }
+      }
+
+      async function addGroup() {
+        const groupId = document.getElementById("groupId").value.trim();
+        const name = document.getElementById("groupName").value.trim();
+        if (!groupId) return setStatus("群号不能为空");
+        try {
+          await request(`${apiBase}/groups/add`, {
+            method: "POST",
+            body: JSON.stringify({ group_id: groupId, name }),
+          });
+          document.getElementById("groupId").value = "";
+          document.getElementById("groupName").value = "";
+          await load();
+          setStatus("已添加");
+        } catch (error) {
+          setStatus(`添加失败：${error.message}`);
+        }
+      }
+
+      async function removeGroup(groupId) {
+        try {
+          await request(`${apiBase}/groups/remove`, {
+            method: "POST",
+            body: JSON.stringify({ group_id: groupId }),
+          });
+          await load();
+          setStatus("已移除");
+        } catch (error) {
+          setStatus(`移除失败：${error.message}`);
+        }
+      }
+
+      document.getElementById("saveBtn").onclick = saveSelected;
+      document.getElementById("refreshBtn").onclick = load;
+      document.getElementById("addBtn").onclick = addGroup;
+
+      async function loadGroups() {
+        let lastError;
+        for (const base of endpointCandidates) {
+          try {
+            const data = await request(`${base}/groups`);
+            apiBase = base;
+            return data;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error("找不到插件 API");
+      }
+
+      load();
+    </script>
+  </body>
+</html>
