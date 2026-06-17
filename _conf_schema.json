@@ -1,0 +1,85 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "target_group_id": {
+    "description": "目标群号",
+    "type": "string",
+    "hint": "留空时自动锁定第一个观察到的群。当前原型只服务一个群。",
+    "default": ""
+  },
+  "scan_interval_seconds": {
+    "description": "后台检查间隔（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "min_attempt_interval_minutes": {
+    "description": "最短尝试插话间隔（分钟）",
+    "type": "int",
+    "default": 20
+  },
+  "max_attempt_interval_minutes": {
+    "description": "最长尝试插话间隔（分钟）",
+    "type": "int",
+    "default": 80
+  },
+  "min_speak_interval_minutes": {
+    "description": "两次真正发言的最短间隔（分钟）",
+    "type": "int",
+    "default": 45
+  },
+  "recent_activity_minutes": {
+    "description": "多久内有群消息才认为当前适合观察（分钟）",
+    "type": "int",
+    "default": 20
+  },
+  "min_recent_messages": {
+    "description": "至少积累多少条群消息才尝试插话",
+    "type": "int",
+    "default": 6
+  },
+  "recent_message_limit": {
+    "description": "每群最多保留多少条短期消息",
+    "type": "int",
+    "default": 200
+  },
+  "prompt_context_messages": {
+    "description": "每次给 LLM 的最近消息数量",
+    "type": "int",
+    "default": 24
+  },
+  "max_reply_chars": {
+    "description": "机器人单次发言最大字符数",
+    "type": "int",
+    "default": 24
+  },
+  "speak_probability": {
+    "description": "通过本地规则后，真正请求 LLM 插话的概率",
+    "type": "float",
+    "hint": "0.0 到 1.0。原型建议低一点，避免太像机器人。",
+    "default": 0.35
+  },
+  "summary_interval_minutes": {
+    "description": "群语境记忆摘要更新间隔（分钟）",
+    "type": "int",
+    "default": 240
+  },
+  "allow_emoji": {
+    "description": "允许输出表情符号",
+    "type": "bool",
+    "default": false
+  },
+  "trim_terminal_punctuation": {
+    "description": "去掉句尾标点，让语气更像群聊短句",
+    "type": "bool",
+    "default": true
+  },
+  "extra_style_hint": {
+    "description": "额外语气提示",
+    "type": "text",
+    "hint": "例如：偏嘴碎一点、少用网络热梗、别卖萌。会追加到 prompt 中。",
+    "default": ""
+  }
+}
