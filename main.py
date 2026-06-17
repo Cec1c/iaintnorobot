@@ -807,7 +807,7 @@ class IAintNoRobot(Star):
         group_id = self._event_group_id(event)
         if not group_id or not self._is_group_allowed(group_id):
             return
-        if not self._is_wake_up(event):
+        if not self._has_direct_bot_mention(event):
             return
 
         text = compact_text(event.message_str or "", 300)
@@ -1456,6 +1456,73 @@ class IAintNoRobot(Star):
             return value
         return False
 
+    def _has_direct_bot_mention(self, event: AstrMessageEvent) -> bool:
+        """Only treat an actual At component to this bot as a direct mention."""
+        bot_ids = self._bot_ids(event)
+        message_chain = getattr(event.message_obj, "message", None) or []
+        has_at_component = False
+        for component in message_chain:
+            has_at_component = has_at_component or self._is_at_component(component)
+            if self._component_mentions_bot(component, bot_ids):
+                return True
+
+        raw_message = getattr(event.message_obj, "raw_message", None)
+        if self._raw_message_mentions_bot(raw_message, bot_ids):
+            return True
+        if not bot_ids and (has_at_component or raw_message_has_any_at(raw_message)):
+            return self._is_wake_up(event)
+
+        return False
+
+    def _bot_ids(self, event: AstrMessageEvent) -> set[str]:
+        candidates = {
+            getattr(event.message_obj, "self_id", ""),
+            getattr(event, "self_id", ""),
+            safe_call(event, "get_self_id") or "",
+        }
+        return {str(candidate) for candidate in candidates if str(candidate)}
+
+    def _component_mentions_bot(self, component: Any, bot_ids: set[str]) -> bool:
+        if not self._is_at_component(component):
+            return False
+        if not bot_ids:
+            return False
+        target = self._at_component_target(component)
+        return str(target) in bot_ids if target is not None else False
+
+    def _is_at_component(self, component: Any) -> bool:
+        class_name = component.__class__.__name__.lower()
+        return class_name == "at" or "at" in class_name
+
+    def _at_component_target(self, component: Any) -> Any:
+        target = (
+            getattr(component, "qq", None)
+            or getattr(component, "user_id", None)
+            or getattr(component, "target", None)
+        )
+        if target is None:
+            data = getattr(component, "data", None)
+            if isinstance(data, dict):
+                target = data.get("qq") or data.get("user_id") or data.get("target")
+        return target
+
+    def _raw_message_mentions_bot(self, raw_message: Any, bot_ids: set[str]) -> bool:
+        if isinstance(raw_message, str):
+            return any(f"[CQ:at,qq={bot_id}]" in raw_message for bot_id in bot_ids)
+        if isinstance(raw_message, list):
+            for segment in raw_message:
+                if not isinstance(segment, dict):
+                    continue
+                if str(segment.get("type", "")).lower() != "at":
+                    continue
+                data = segment.get("data") or {}
+                target = data.get("qq") or data.get("user_id") or data.get("target")
+                if str(target) in bot_ids:
+                    return True
+        if isinstance(raw_message, dict):
+            return self._raw_message_mentions_bot(raw_message.get("message"), bot_ids)
+        return False
+
     def _should_passthrough_mention(self, text: str) -> bool:
         text = strip_mention_noise(text)
         if not text:
@@ -1696,6 +1763,20 @@ def strip_mention_noise(text: str) -> str:
     text = re.sub(r"\[CQ:at,qq=(?:all|\d+)\]", " ", text)
     text = re.sub(r"@\S+", " ", text)
     return compact_text(text, 300)
+
+
+def raw_message_has_any_at(raw_message: Any) -> bool:
+    if isinstance(raw_message, str):
+        return "[CQ:at,qq=" in raw_message
+    if isinstance(raw_message, list):
+        return any(
+            isinstance(segment, dict)
+            and str(segment.get("type", "")).lower() == "at"
+            for segment in raw_message
+        )
+    if isinstance(raw_message, dict):
+        return raw_message_has_any_at(raw_message.get("message"))
+    return False
 
 
 def format_messages(messages: list[dict[str, Any]]) -> str:
