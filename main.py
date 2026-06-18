@@ -8,6 +8,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from sys import maxsize
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover - only used on old AstrBot versions.
 
 
 PLUGIN_NAME = "astrbot_plugin_i_aint_no_robot"
+MENTION_HANDLER_PRIORITY = maxsize
 
 AI_SMELL_WORDS = (
     "作为ai",
@@ -578,7 +580,7 @@ class MemoryStore:
         )
 
 
-@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.1")
+@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.2")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -792,7 +794,10 @@ class IAintNoRobot(Star):
         self.store.clear_group(group_id)
         yield event.plain_result("清了")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=100)
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE,
+        priority=MENTION_HANDLER_PRIORITY,
+    )
     async def handle_mention(self, event: AstrMessageEvent):
         """接管群内直接艾特，避免落到默认标准 LLM 回复。"""
         if (
@@ -815,27 +820,36 @@ class IAintNoRobot(Star):
         if mention_text and self._should_passthrough_mention(mention_text):
             return
 
+        self._suppress_default_llm(event)
+        self._stop_event(event)
+        self._cancel_pending_reply(group_id)
         self._lock_active_group(group_id)
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
         if mention_text:
             self._remember_event_message(group_id, event, mention_text)
 
-        reply = None
-        probability = float(self.config.get("mention_reply_probability", 1.0))
-        if random.random() <= max(0.0, min(1.0, probability)):
-            reply = await self._generate_reply(
-                group_id,
-                force=True,
-                mode="mention",
-                current_message=mention_text or "有人只艾特了你，没说别的",
-            )
-        if not reply:
-            reply = random.choice(("干嘛", "咋了", "说", "咋"))
+        if not mention_text:
+            reply = self._short_mention_fallback()
+        else:
+            reply = None
+            probability = float(self.config.get("mention_reply_probability", 1.0))
+            if random.random() <= max(0.0, min(1.0, probability)):
+                reply = await self._generate_reply(
+                    group_id,
+                    force=True,
+                    mode="mention",
+                    current_message=mention_text,
+                )
+            if not reply:
+                reply = self._short_mention_fallback()
+
         result = event.plain_result(reply)
         if bool(self.config.get("stop_default_mention_reply", True)):
             result.stop_event()
+            self._stop_event(event)
         yield result
         self.store.mark_spoke(group_id, reply)
+        await self._refresh_viewpoint(group_id)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def observe_group(self, event: AstrMessageEvent):
@@ -852,6 +866,9 @@ class IAintNoRobot(Star):
 
         text = compact_text(event.message_str or "", 300)
         if not text or text.startswith("/iar"):
+            return
+
+        if self._has_direct_bot_mention(event):
             return
 
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
@@ -891,7 +908,7 @@ class IAintNoRobot(Star):
             status="confirmed",
             source="insider",
         )
-        self.store.mark_insider_answered(int(question["id"]))
+        self.store.mark_insider_answered(question["id"])
 
     async def _background_loop(self) -> None:
         await asyncio.sleep(3)
@@ -970,6 +987,11 @@ class IAintNoRobot(Star):
         task = asyncio.create_task(self._delayed_reply_worker(pending, delay))
         self.pending_reply_tasks[group_id] = task
         return True
+
+    def _cancel_pending_reply(self, group_id: str) -> None:
+        task = self.pending_reply_tasks.pop(group_id, None)
+        if task and not task.done():
+            task.cancel()
 
     def _reply_delay_seconds(self) -> int:
         min_s = max(0, int(self.config.get("reply_delay_min_seconds", 3)))
@@ -1511,6 +1533,9 @@ class IAintNoRobot(Star):
             return value
         return False
 
+    def _is_at_or_wake_command(self, event: AstrMessageEvent) -> bool:
+        return bool(getattr(event, "is_at_or_wake_command", False))
+
     def _has_direct_bot_mention(self, event: AstrMessageEvent) -> bool:
         """Only treat an actual At component to this bot as a direct mention."""
         bot_ids = self._bot_ids(event)
@@ -1532,9 +1557,22 @@ class IAintNoRobot(Star):
             or raw_message_has_any_at(raw_message)
             or text_message_has_any_at(message_text)
         ):
-            return self._is_wake_up(event)
+            return self._is_at_or_wake_command(event)
 
         return False
+
+    def _suppress_default_llm(self, event: AstrMessageEvent) -> None:
+        method = getattr(event, "should_call_llm", None)
+        try:
+            if method:
+                method(True)
+            else:
+                setattr(event, "call_llm", True)
+        except Exception as exc:
+            logger.debug(f"{PLUGIN_NAME} suppress default llm failed: {exc}")
+
+    def _short_mention_fallback(self) -> str:
+        return random.choice(("干嘛", "咋了", "说", "咋"))
 
     def _bot_ids(self, event: AstrMessageEvent) -> set[str]:
         candidates = {
