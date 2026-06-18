@@ -927,19 +927,24 @@ class IAintNoRobot(Star):
         if now < state.next_attempt_at:
             return
 
-        self._schedule_next_attempt(group_id)
         if not self._local_gate_allows(state):
+            self._schedule_short_retry(group_id)
             return
 
         probability = float(self.config.get("speak_probability", 0.35))
         if random.random() > max(0.0, min(1.0, probability)):
+            self._schedule_short_retry(group_id)
             return
 
-        self._schedule_delayed_reply(
+        scheduled = self._schedule_delayed_reply(
             group_id,
             mode="ambient",
             trigger_message="",
         )
+        if scheduled:
+            self._schedule_next_attempt(group_id)
+        else:
+            self._schedule_short_retry(group_id)
 
     def _schedule_delayed_reply(
         self,
@@ -951,7 +956,7 @@ class IAintNoRobot(Star):
             return False
         existing = self.pending_reply_tasks.get(group_id)
         if existing and not existing.done():
-            return True
+            return False
 
         delay = self._reply_delay_seconds()
         pending = PendingReply(
@@ -1422,6 +1427,12 @@ class IAintNoRobot(Star):
         max_min = max(min_min, int(self.config.get("max_attempt_interval_minutes", 80)))
         next_at = int(time.time()) + random.randint(min_min * 60, max_min * 60)
         self.store.set_next_attempt(group_id, next_at)
+
+    def _schedule_short_retry(self, group_id: str) -> None:
+        if not self.store:
+            return
+        minutes = max(1, int(self.config.get("no_reply_retry_minutes", 3)))
+        self.store.set_next_attempt(group_id, int(time.time()) + minutes * 60)
 
     def _remember_event_message(
         self,

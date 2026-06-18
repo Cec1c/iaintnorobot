@@ -49,6 +49,12 @@
     "type": "int",
     "default": 80
   },
+  "no_reply_retry_minutes": {
+    "description": "未触发时重试间隔（分钟）",
+    "type": "int",
+    "hint": "条件不满足、概率没中、已有待回复任务时，不进入长冷却，只隔一小会儿再看。",
+    "default": 3
+  },
   "min_speak_interval_minutes": {
     "description": "两次真正发言的最短间隔（分钟）",
     "type": "int",

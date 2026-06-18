@@ -49,6 +49,7 @@ managed_groups = 已添加群聊
 scan_interval_seconds = 60
 min_attempt_interval_minutes = 20
 max_attempt_interval_minutes = 80
+no_reply_retry_minutes = 3
 min_speak_interval_minutes = 45
 speak_probability = 0.35
 ```
@@ -68,6 +69,12 @@ min_attempt_interval_minutes
 ```
 
 最小发起发言周期。达到周期后，插件仍会先判断有没有可附和或可讨论的话题。
+
+```text
+no_reply_retry_minutes
+```
+
+未触发时重试间隔。条件不满足、概率没中、已有待回复任务时，不会进入 20-80 分钟长冷却，只隔这段时间再看。
 
 ```text
 allow_self_start
