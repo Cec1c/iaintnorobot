@@ -1,7 +1,7 @@
 name: astrbot_plugin_i_aint_no_robot
 display_name: I Ain't No Robot
-desc: 单群低频自然插话原型，让机器人少说、短说、像人一样偶尔接一句。
-version: v0.3.0
+desc: 低频自然插话原型，让机器人少说、短说、像人一样偶尔接一句。
+version: v0.4.0
 author: "15185"
 repo: ""
 support_platforms:

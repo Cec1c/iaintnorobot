@@ -29,20 +29,18 @@ astrbot_plugin_i_aint_no_robot/
 
 ## 配置
 
-推荐先只配置一个群：
+推荐先配置一个或少量群：
 
 ```text
 managed_groups = 已添加群聊
-target_group_id = 当前选择的目标群号
 ```
 
-推荐在 AstrBot WebUI 的插件配置面板里先添加群聊，再到插件详情页的“群聊选择”页面用下拉框选择目标群。下拉框只显示已添加且启用的群聊。
+推荐在 AstrBot WebUI 的插件配置面板里先添加群聊。`managed_groups` 里启用的群都会作为目标群运行；不再需要单独选择“当前目标群”。
 
 也可以在目标群里使用：
 
 ```text
 /iar addgroup
-/iar select 群号
 ```
 
 原型阶段建议保持低频：
@@ -60,16 +58,10 @@ speak_probability = 0.35
 ### WebUI 关键配置
 
 ```text
-target_group_id
-```
-
-当前选择的目标群号。应来自 `managed_groups`。
-
-```text
 managed_groups
 ```
 
-已添加群聊列表。插件只会在这里添加且启用的群聊中运行。
+已添加群聊列表。插件只会在这里添加且启用的群聊中运行。每个群条目里的“是否在该群启用”就是该群的开关。
 
 ```text
 min_attempt_interval_minutes
@@ -132,9 +124,8 @@ insider_question_cooldown_minutes
 /iar status   查看状态
 /iar on       开启当前群
 /iar off      关闭当前群
-/iar addgroup 把当前群加入 WebUI 可选群聊
+/iar addgroup 把当前群加入并启用
 /iar groups   查看已添加群聊
-/iar select   选择已添加群聊作为目标
 /iar say      强制尝试生成一句，方便测试
 /iar summary  手动刷新群语境记忆
 /iar slang    查看黑话记忆
@@ -159,7 +150,7 @@ data/plugin_data/astrbot_plugin_i_aint_no_robot/memory.sqlite3
 - 只有周期检查通过本地规则后才调用 LLM。
 - 黑话学习默认 180 分钟扫描一次，避免频繁调用 LLM。
 
-单群使用时，存储通常是 MB 级别，内存占用也很低。
+轻量使用时，存储通常是 MB 级别，内存占用也很低。
 
 ## 调试建议
 

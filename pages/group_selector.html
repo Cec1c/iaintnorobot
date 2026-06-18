@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>群聊选择</title>
+    <title>群聊管理</title>
     <style>
       :root {
         color-scheme: light dark;
@@ -16,7 +16,7 @@
       }
 
       main {
-        max-width: 720px;
+        max-width: 760px;
       }
 
       h1 {
@@ -31,11 +31,9 @@
         font-weight: 600;
       }
 
-      select,
       input {
         box-sizing: border-box;
         width: 100%;
-        max-width: 480px;
         height: 36px;
         padding: 0 10px;
         border: 1px solid #9ca3af;
@@ -67,12 +65,6 @@
         flex: 1;
       }
 
-      .actions {
-        display: flex;
-        gap: 8px;
-        margin-top: 12px;
-      }
-
       .status {
         margin-top: 14px;
         min-height: 22px;
@@ -94,6 +86,12 @@
         border-top: 1px solid #d1d5db;
       }
 
+      .actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
       .muted {
         color: #6b7280;
         font-size: 13px;
@@ -102,14 +100,7 @@
   </head>
   <body>
     <main>
-      <h1>群聊选择</h1>
-
-      <label for="groupSelect">当前目标群</label>
-      <select id="groupSelect"></select>
-      <div class="actions">
-        <button id="saveBtn" type="button">保存选择</button>
-        <button id="refreshBtn" type="button">刷新</button>
-      </div>
+      <h1>群聊管理</h1>
 
       <div class="row">
         <div class="field">
@@ -120,7 +111,8 @@
           <label for="groupName">显示名称</label>
           <input id="groupName" autocomplete="off" />
         </div>
-        <button id="addBtn" type="button">添加</button>
+        <button id="addBtn" type="button">添加并启用</button>
+        <button id="refreshBtn" type="button">刷新</button>
       </div>
 
       <div id="status" class="status"></div>
@@ -137,9 +129,7 @@
       ];
 
       let apiBase = endpointCandidates[0];
-
       const statusEl = document.getElementById("status");
-      const selectEl = document.getElementById("groupSelect");
       const listEl = document.getElementById("groupList");
 
       function setStatus(text) {
@@ -157,34 +147,35 @@
 
       function render(data) {
         const groups = data.groups || [];
-        selectEl.innerHTML = "";
         listEl.innerHTML = "";
-
         if (!groups.length) {
-          const option = document.createElement("option");
-          option.textContent = "还没有添加群聊";
-          option.value = "";
-          selectEl.appendChild(option);
+          const item = document.createElement("li");
+          item.textContent = "还没有添加群聊";
+          listEl.appendChild(item);
           return;
         }
 
         for (const group of groups) {
-          if (group.enabled) {
-            const option = document.createElement("option");
-            option.value = group.group_id;
-            option.textContent = `${group.name} / ${group.group_id}`;
-            option.selected = group.group_id === data.selected;
-            selectEl.appendChild(option);
-          }
-
           const item = document.createElement("li");
           const title = document.createElement("div");
-          title.innerHTML = `<strong>${group.name}</strong><div class="muted">${group.group_id}</div>`;
+          const state = group.enabled ? "已启用" : "已停用";
+          title.innerHTML = `<strong>${group.name}</strong><div class="muted">${group.group_id} / ${state}</div>`;
+
+          const actions = document.createElement("div");
+          actions.className = "actions";
+
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.textContent = group.enabled ? "停用" : "启用";
+          toggle.onclick = () => setGroupEnabled(group.group_id, !group.enabled);
+
           const remove = document.createElement("button");
           remove.type = "button";
           remove.textContent = "移除";
           remove.onclick = () => removeGroup(group.group_id);
-          item.append(title, remove);
+
+          actions.append(toggle, remove);
+          item.append(title, actions);
           listEl.appendChild(item);
         }
       }
@@ -199,19 +190,6 @@
         }
       }
 
-      async function saveSelected() {
-        if (!selectEl.value) return setStatus("没有可选群聊");
-        try {
-          await request(`${apiBase}/groups/select`, {
-            method: "POST",
-            body: JSON.stringify({ group_id: selectEl.value }),
-          });
-          setStatus("已保存");
-        } catch (error) {
-          setStatus(`保存失败：${error.message}`);
-        }
-      }
-
       async function addGroup() {
         const groupId = document.getElementById("groupId").value.trim();
         const name = document.getElementById("groupName").value.trim();
@@ -219,7 +197,7 @@
         try {
           await request(`${apiBase}/groups/add`, {
             method: "POST",
-            body: JSON.stringify({ group_id: groupId, name }),
+            body: JSON.stringify({ group_id: groupId, name, enabled: true }),
           });
           document.getElementById("groupId").value = "";
           document.getElementById("groupName").value = "";
@@ -227,6 +205,19 @@
           setStatus("已添加");
         } catch (error) {
           setStatus(`添加失败：${error.message}`);
+        }
+      }
+
+      async function setGroupEnabled(groupId, enabled) {
+        try {
+          await request(`${apiBase}/groups/enabled`, {
+            method: "POST",
+            body: JSON.stringify({ group_id: groupId, enabled }),
+          });
+          await load();
+          setStatus(enabled ? "已启用" : "已停用");
+        } catch (error) {
+          setStatus(`修改失败：${error.message}`);
         }
       }
 
@@ -243,7 +234,6 @@
         }
       }
 
-      document.getElementById("saveBtn").onclick = saveSelected;
       document.getElementById("refreshBtn").onclick = load;
       document.getElementById("addBtn").onclick = addGroup;
 

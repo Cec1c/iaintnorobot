@@ -578,7 +578,7 @@ class MemoryStore:
         )
 
 
-@register(PLUGIN_NAME, "15185", "单群低频自然插话原型", "0.3.0")
+@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.0")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -586,18 +586,16 @@ class IAintNoRobot(Star):
         self.store: MemoryStore | None = None
         self.worker_task: asyncio.Task | None = None
         self.pending_reply_tasks: dict[str, asyncio.Task] = {}
-        self.active_group_id = str(self.config.get("target_group_id", "")).strip()
+        self.active_group_id = ""
         self._register_page_apis(context)
 
     async def initialize(self) -> None:
+        self._migrate_legacy_target_group()
         data_dir = self._plugin_data_dir()
         recent_limit = int(self.config.get("recent_message_limit", 200))
         max_slang_terms = int(self.config.get("max_slang_terms", 80))
         self.store = MemoryStore(data_dir / "memory.sqlite3", recent_limit, max_slang_terms)
         self.store.initialize()
-        self.active_group_id = self._selected_group_id()
-        if not self.active_group_id and not self._managed_groups():
-            self.active_group_id = self.store.get_first_group_id() or ""
         self.worker_task = asyncio.create_task(self._background_loop())
         logger.info(f"{PLUGIN_NAME} initialized, data_dir={data_dir}")
 
@@ -625,9 +623,14 @@ class IAintNoRobot(Star):
     @iar.command("status")
     async def status(self, event: AstrMessageEvent):
         """查看当前原型状态。"""
-        group_id = self._event_group_id(event) or self.active_group_id
+        group_id = self._event_group_id(event)
         if not group_id or not self.store:
-            yield event.plain_result("还没观察到群")
+            groups = self._managed_groups(include_disabled=True)
+            if groups:
+                enabled = sum(1 for group in groups if group["enabled"])
+                yield event.plain_result(f"已添加群：{len(groups)} 个，启用：{enabled} 个")
+            else:
+                yield event.plain_result("还没添加群聊")
             return
 
         state = self.store.get_state(group_id)
@@ -642,7 +645,7 @@ class IAintNoRobot(Star):
                 [
                     f"群：{group_id}",
                     f"已添加群：{'是' if self._is_group_allowed(group_id) else '否'}",
-                    f"开关：{'开' if state.enabled else '关'}",
+                    f"开关：{'开' if self._is_group_allowed(group_id) else '关'}",
                     f"短期消息：{stats['messages']} 条",
                     f"机器人发过：{stats['bot_messages']} 条",
                     f"黑话记忆：{stats['confirmed_slang_terms']}/{stats['slang_terms']} 条",
@@ -676,10 +679,19 @@ class IAintNoRobot(Star):
     @iar.command("off")
     async def turn_off(self, event: AstrMessageEvent):
         """关闭当前群的自然插话。"""
-        group_id = self._event_group_id(event) or self.active_group_id
+        group_id = self._event_group_id(event)
         if not group_id or not self.store:
-            yield event.plain_result("还没观察到群")
+            yield event.plain_result("只能在群里用")
             return
+        if not self._managed_group_exists(group_id, enabled_only=False):
+            self._ensure_managed_group(
+                group_id,
+                safe_call(event, "get_group_name") or f"群 {group_id}",
+                enabled=False,
+            )
+        else:
+            self._set_managed_group_enabled(group_id, False)
+        await self._save_config()
         self.store.set_enabled(group_id, False)
         yield event.plain_result("关了")
 
@@ -702,25 +714,11 @@ class IAintNoRobot(Star):
         if not groups:
             yield event.plain_result("还没添加群聊")
             return
-        selected = self._selected_group_id()
         lines = []
         for group in groups:
-            mark = "*" if group["group_id"] == selected else "-"
             enabled = "开" if group["enabled"] else "关"
-            lines.append(f"{mark} {group['name']} / {group['group_id']} / {enabled}")
+            lines.append(f"- {group['name']} / {group['group_id']} / {enabled}")
         yield event.plain_result("\n".join(lines))
-
-    @iar.command("select")
-    async def select_group(self, event: AstrMessageEvent, group_id: str):
-        """选择目标群号，必须来自已添加群聊。"""
-        group_id = str(group_id).strip()
-        if not self._managed_group_exists(group_id, enabled_only=True):
-            yield event.plain_result("这个群没添加，先 /iar addgroup")
-            return
-        self.config["target_group_id"] = group_id
-        self.active_group_id = group_id
-        await self._save_config()
-        yield event.plain_result("选好了")
 
     @iar.command("say")
     async def force_say(self, event: AstrMessageEvent):
@@ -740,7 +738,7 @@ class IAintNoRobot(Star):
     @iar.command("summary")
     async def force_summary(self, event: AstrMessageEvent):
         """手动刷新群语境记忆。"""
-        group_id = self._event_group_id(event) or self.active_group_id
+        group_id = self._event_group_id(event)
         if not group_id or not self.store:
             yield event.plain_result("还没观察到群")
             return
@@ -756,7 +754,7 @@ class IAintNoRobot(Star):
     @iar.command("slang")
     async def show_slang(self, event: AstrMessageEvent):
         """查看当前群已理解的黑话。"""
-        group_id = self._event_group_id(event) or self.active_group_id
+        group_id = self._event_group_id(event)
         if not group_id or not self.store:
             yield event.plain_result("还没观察到群")
             return
@@ -774,7 +772,7 @@ class IAintNoRobot(Star):
     @iar.command("learn")
     async def force_learn_slang(self, event: AstrMessageEvent):
         """手动扫描当前群黑话。"""
-        group_id = self._event_group_id(event) or self.active_group_id
+        group_id = self._event_group_id(event)
         if not group_id or not self.store:
             yield event.plain_result("还没观察到群")
             return
@@ -787,7 +785,7 @@ class IAintNoRobot(Star):
     @iar.command("reset")
     async def reset_group(self, event: AstrMessageEvent):
         """清空当前群的插件记忆。"""
-        group_id = self._event_group_id(event) or self.active_group_id
+        group_id = self._event_group_id(event)
         if not group_id or not self.store:
             yield event.plain_result("还没观察到群")
             return
@@ -833,11 +831,11 @@ class IAintNoRobot(Star):
             )
         if not reply:
             reply = random.choice(("干嘛", "咋了", "说", "咋"))
-        yield event.plain_result(reply)
-        self.store.mark_spoke(group_id, reply)
-
+        result = event.plain_result(reply)
         if bool(self.config.get("stop_default_mention_reply", True)):
-            self._stop_event(event)
+            result.stop_event()
+        yield result
+        self.store.mark_spoke(group_id, reply)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def observe_group(self, event: AstrMessageEvent):
@@ -849,11 +847,8 @@ class IAintNoRobot(Star):
         if not group_id:
             return
 
-        if self.active_group_id and group_id != self.active_group_id:
-            return
         if not self._is_group_allowed(group_id):
             return
-        self._lock_active_group(group_id)
 
         text = compact_text(event.message_str or "", 300)
         if not text or text.startswith("/iar"):
@@ -914,19 +909,18 @@ class IAintNoRobot(Star):
         if not bool(self.config.get("enabled", True)) or not self.store:
             return
 
-        group_id = self.active_group_id or self.store.get_first_group_id()
-        if not group_id:
-            return
-        if not self._is_group_allowed(group_id):
-            self.active_group_id = self._selected_group_id()
-            return
-        self.active_group_id = group_id
+        for group_id in self._target_group_ids():
+            await self._tick_group(group_id)
 
+    async def _tick_group(self, group_id: str) -> None:
+        assert self.store is not None
+        if not self._is_group_allowed(group_id):
+            return
         await self._maybe_refresh_summary(group_id)
         await self._maybe_refresh_slang(group_id)
 
         state = self.store.get_state(group_id)
-        if not state or not state.enabled:
+        if not state:
             return
 
         now = int(time.time())
@@ -993,7 +987,7 @@ class IAintNoRobot(Star):
         if not self.store:
             return
         state = self.store.get_state(pending.group_id)
-        if not state or not state.enabled or not self._is_group_allowed(pending.group_id):
+        if not state or not self._is_group_allowed(pending.group_id):
             return
         now = int(time.time())
         stale_after = max(10, int(self.config.get("reply_stale_seconds", 150)))
@@ -1473,7 +1467,14 @@ class IAintNoRobot(Star):
         raw_message = getattr(event.message_obj, "raw_message", None)
         if self._raw_message_mentions_bot(raw_message, bot_ids):
             return True
-        if not bot_ids and (has_at_component or raw_message_has_any_at(raw_message)):
+        message_text = str(getattr(event, "message_str", "") or "")
+        if self._text_message_mentions_bot(message_text, bot_ids):
+            return True
+        if not bot_ids and (
+            has_at_component
+            or raw_message_has_any_at(raw_message)
+            or text_message_has_any_at(message_text)
+        ):
             return self._is_wake_up(event)
 
         return False
@@ -1527,6 +1528,14 @@ class IAintNoRobot(Star):
             return self._raw_message_mentions_bot(raw_message.get("message"), bot_ids)
         return False
 
+    def _text_message_mentions_bot(self, text: str, bot_ids: set[str]) -> bool:
+        if not text or not bot_ids:
+            return False
+        return any(
+            f"[CQ:at,qq={bot_id}]" in text or f"[At:{bot_id}]" in text
+            for bot_id in bot_ids
+        )
+
     def _should_passthrough_mention(self, text: str) -> bool:
         text = strip_mention_noise(text)
         if not text:
@@ -1566,7 +1575,7 @@ class IAintNoRobot(Star):
         routes = (
             ("/iar/groups", self._api_groups, ["GET"]),
             ("/iar/groups/add", self._api_add_group, ["POST"]),
-            ("/iar/groups/select", self._api_select_group, ["POST"]),
+            ("/iar/groups/enabled", self._api_set_group_enabled, ["POST"]),
             ("/iar/groups/remove", self._api_remove_group, ["POST"]),
         )
         for path, handler, methods in routes:
@@ -1583,7 +1592,6 @@ class IAintNoRobot(Star):
     async def _api_groups(self, *args: Any):
         return json_response(
             {
-                "selected": self._selected_group_id(),
                 "groups": self._managed_groups(include_disabled=True),
             }
         )
@@ -1594,19 +1602,22 @@ class IAintNoRobot(Star):
         name = compact_text(payload.get("name", ""), 80) or f"群 {group_id}"
         if not group_id:
             return self._web_error("群号不能为空")
-        self._ensure_managed_group(group_id, name, enabled=True)
+        enabled = bool(payload.get("enabled", True))
+        self._ensure_managed_group(group_id, name, enabled=enabled)
         await self._save_config()
         return json_response({"ok": True, "groups": self._managed_groups(include_disabled=True)})
 
-    async def _api_select_group(self, *args: Any):
+    async def _api_set_group_enabled(self, *args: Any):
         payload = await self._request_json(args[0] if args else None)
         group_id = compact_text(payload.get("group_id", ""), 40)
-        if not self._managed_group_exists(group_id, enabled_only=True):
-            return self._web_error("只能选择已添加且启用的群聊")
-        self.config["target_group_id"] = group_id
-        self.active_group_id = group_id
+        if not self._managed_group_exists(group_id, enabled_only=False):
+            return self._web_error("群聊不存在")
+        enabled = bool(payload.get("enabled", True))
+        self._set_managed_group_enabled(group_id, enabled)
+        if self.store:
+            self.store.set_enabled(group_id, enabled)
         await self._save_config()
-        return json_response({"ok": True, "selected": group_id})
+        return json_response({"ok": True, "groups": self._managed_groups(include_disabled=True)})
 
     async def _api_remove_group(self, *args: Any):
         payload = await self._request_json(args[0] if args else None)
@@ -1617,14 +1628,10 @@ class IAintNoRobot(Star):
             if group["group_id"] != group_id
         ]
         self.config["managed_groups"] = groups
-        if str(self.config.get("target_group_id", "")).strip() == group_id:
-            self.config["target_group_id"] = ""
-            self.active_group_id = self._first_enabled_managed_group_id()
         await self._save_config()
         return json_response(
             {
                 "ok": True,
-                "selected": self._selected_group_id(),
                 "groups": self._managed_groups(include_disabled=True),
             }
         )
@@ -1669,6 +1676,16 @@ class IAintNoRobot(Star):
             seen.add(group_id)
         return groups
 
+    def _migrate_legacy_target_group(self) -> None:
+        target_group_id = str(self.config.get("target_group_id", "")).strip()
+        if target_group_id and not self._managed_group_exists(target_group_id):
+            self._ensure_managed_group(target_group_id, f"群 {target_group_id}", enabled=True)
+        if "target_group_id" in self.config:
+            try:
+                self.config["target_group_id"] = ""
+            except Exception:
+                pass
+
     def _managed_group_exists(self, group_id: str, enabled_only: bool = False) -> bool:
         group_id = str(group_id).strip()
         return any(
@@ -1694,17 +1711,25 @@ class IAintNoRobot(Star):
         self.config["managed_groups"] = groups
         return True
 
-    def _first_enabled_managed_group_id(self) -> str:
-        groups = self._managed_groups(include_disabled=False)
-        return groups[0]["group_id"] if groups else ""
+    def _set_managed_group_enabled(self, group_id: str, enabled: bool) -> bool:
+        groups = self._managed_groups(include_disabled=True)
+        changed = False
+        for group in groups:
+            if group["group_id"] == str(group_id).strip():
+                group["enabled"] = enabled
+                changed = True
+                break
+        self.config["managed_groups"] = groups
+        return changed
 
-    def _selected_group_id(self) -> str:
-        configured = str(self.config.get("target_group_id", "")).strip()
-        if self._managed_groups(include_disabled=True):
-            if self._managed_group_exists(configured, enabled_only=True):
-                return configured
-            return self._first_enabled_managed_group_id()
-        return configured
+    def _target_group_ids(self) -> list[str]:
+        groups = self._managed_groups(include_disabled=False)
+        if groups:
+            return [group["group_id"] for group in groups]
+        if self.store:
+            first_group_id = self.store.get_first_group_id()
+            return [first_group_id] if first_group_id else []
+        return []
 
     def _is_group_allowed(self, group_id: str) -> bool:
         group_id = str(group_id).strip()
@@ -1712,8 +1737,7 @@ class IAintNoRobot(Star):
             return False
         if self._managed_groups(include_disabled=True):
             return self._managed_group_exists(group_id, enabled_only=True)
-        configured = str(self.config.get("target_group_id", "")).strip()
-        return not configured or group_id == configured
+        return True
 
     async def _save_config(self) -> None:
         save = getattr(self.config, "save_config", None)
@@ -1737,8 +1761,7 @@ class IAintNoRobot(Star):
         return str(getattr(event.message_obj, "group_id", "") or "")
 
     def _lock_active_group(self, group_id: str) -> None:
-        selected = self._selected_group_id()
-        self.active_group_id = selected or group_id
+        self.active_group_id = group_id
 
     def _message_attr(self, event: AstrMessageEvent, obj_name: str, attr_name: str) -> Any:
         obj = getattr(event.message_obj, obj_name, None)
@@ -1765,6 +1788,7 @@ def compact_text(text: str, limit: int) -> str:
 def strip_mention_noise(text: str) -> str:
     text = str(text or "")
     text = re.sub(r"\[CQ:at,qq=(?:all|\d+)\]", " ", text)
+    text = re.sub(r"\[At:(?:all|\d+)\]", " ", text)
     text = re.sub(r"@\S+", " ", text)
     return compact_text(text, 300)
 
@@ -1781,6 +1805,11 @@ def raw_message_has_any_at(raw_message: Any) -> bool:
     if isinstance(raw_message, dict):
         return raw_message_has_any_at(raw_message.get("message"))
     return False
+
+
+def text_message_has_any_at(text: str) -> bool:
+    text = str(text or "")
+    return "[CQ:at,qq=" in text or "[At:" in text
 
 
 def format_messages(messages: list[dict[str, Any]]) -> str:
