@@ -88,6 +88,9 @@ self_start_style_examples
 handle_mentions
 mention_reply_max_chars
 mention_reply_probability
+handle_implicit_replies
+implicit_reply_probability
+implicit_reply_window_seconds
 reply_delay_min_seconds
 reply_delay_max_seconds
 reply_stale_seconds
@@ -97,7 +100,9 @@ mention_passthrough_patterns
 
 控制群内直接艾特。开启后，被艾特时会使用插件的人味短句回复；默认阻止 AstrBot 标准 LLM 回复，避免冒出一大段客服腔。
 
-这个插件的艾特处理器优先级较低，默认让其他插件先处理。`mention_passthrough_patterns` 是命令放行规则，一行一个正则；命中后本插件不回复也不阻断，例如 `/在线`、`重启服务器`。
+这个插件的艾特处理器优先级较高，用来抢在默认 LLM 前面接管。`mention_passthrough_patterns` 是命令放行规则，一行一个正则；命中后本插件不回复也不阻断，例如 `/在线`、`重启服务器`。
+
+`handle_implicit_replies` 用于处理“没有 @，但可能是在跟机器人说话”的消息。判断依据包括机器人刚说完后的短句、二人称追问、提到 AI/机器人/插件/默认回复等。命中后仍会交给 LLM 判断，不确定就输出 `SILENT`。
 
 主动插话触发后不会立刻回复，会在 `reply_delay_min_seconds` 到 `reply_delay_max_seconds` 之间随机等待。到点后会重新读取最新群聊；如果最近消息已经超过 `reply_stale_seconds`，就不回复旧话题。直接艾特会立即短回，用来压住 AstrBot 默认标准回复。
 

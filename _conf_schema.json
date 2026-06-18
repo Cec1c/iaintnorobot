@@ -130,6 +130,24 @@
     "hint": "一行一个正则。命中后不接管，让其他插件或 AstrBot 默认逻辑处理。例如 /在线、重启服务器。",
     "default": "^[/.!！#]\\S*\n重启服务器\n^/?在线"
   },
+  "handle_implicit_replies": {
+    "description": "接管疑似对机器人说话的非艾特消息",
+    "type": "bool",
+    "hint": "例如机器人刚说完后，群友接着说“哎”“你妈”“怎么拦它”等，会短延迟后交给 LLM 判断是否要回。",
+    "default": true
+  },
+  "implicit_reply_probability": {
+    "description": "疑似对话回复概率",
+    "type": "float",
+    "hint": "0.0 到 1.0。用于避免机器人逢话就接。",
+    "default": 0.45
+  },
+  "implicit_reply_window_seconds": {
+    "description": "疑似对话窗口（秒）",
+    "type": "int",
+    "hint": "机器人刚说完后这段时间内，后续短句更可能是在跟它说话。",
+    "default": 90
+  },
   "speak_probability": {
     "description": "通过本地规则后，真正请求 LLM 插话的概率",
     "type": "float",

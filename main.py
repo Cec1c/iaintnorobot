@@ -578,7 +578,7 @@ class MemoryStore:
         )
 
 
-@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.0")
+@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.1")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -792,7 +792,7 @@ class IAintNoRobot(Star):
         self.store.clear_group(group_id)
         yield event.plain_result("清了")
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-100)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=100)
     async def handle_mention(self, event: AstrMessageEvent):
         """接管群内直接艾特，避免落到默认标准 LLM 回复。"""
         if (
@@ -856,6 +856,7 @@ class IAintNoRobot(Star):
 
         self.store.ensure_group(group_id, event.unified_msg_origin, True)
         self._remember_event_message(group_id, event, text)
+        self._maybe_schedule_implicit_reply(group_id, text)
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def observe_private(self, event: AstrMessageEvent):
@@ -1012,7 +1013,7 @@ class IAintNoRobot(Star):
             return
         if state.last_spoke_at and latest_created_at <= state.last_spoke_at:
             return
-        if pending.mode != "mention":
+        if pending.mode == "ambient":
             speak_gap = int(self.config.get("min_speak_interval_minutes", 45)) * 60
             if state.last_spoke_at and now - state.last_spoke_at < speak_gap:
                 return
@@ -1044,6 +1045,51 @@ class IAintNoRobot(Star):
             now - active_window,
         )
         return recent_count >= min_messages
+
+    def _maybe_schedule_implicit_reply(self, group_id: str, text: str) -> None:
+        if not self.store or not bool(self.config.get("handle_implicit_replies", True)):
+            return
+        if self._should_passthrough_mention(text):
+            return
+
+        state = self.store.get_state(group_id)
+        if not state or not state.last_spoke_at:
+            return
+
+        now = int(time.time())
+        window = max(5, int(self.config.get("implicit_reply_window_seconds", 90)))
+        if now - state.last_spoke_at > window and not looks_like_bot_directed_text(text):
+            return
+
+        if not self._looks_like_implicit_bot_dialogue(text, state.last_spoke_at, now):
+            return
+
+        probability = float(self.config.get("implicit_reply_probability", 0.45))
+        if random.random() > max(0.0, min(1.0, probability)):
+            return
+
+        self._schedule_delayed_reply(
+            group_id,
+            mode="implicit",
+            trigger_message=text,
+        )
+
+    def _looks_like_implicit_bot_dialogue(
+        self,
+        text: str,
+        last_spoke_at: int,
+        now: int,
+    ) -> bool:
+        clean = strip_mention_noise(text)
+        if not clean:
+            return False
+        window = max(5, int(self.config.get("implicit_reply_window_seconds", 90)))
+        recent_bot_reply = now - last_spoke_at <= window
+        if recent_bot_reply and len(clean) <= 24:
+            return True
+        if looks_like_bot_directed_text(clean):
+            return True
+        return False
 
     async def _maybe_refresh_summary(self, group_id: str) -> None:
         if not self.store:
@@ -1823,6 +1869,42 @@ def text_message_has_any_at(text: str) -> bool:
     return "[CQ:at,qq=" in text or "[At:" in text
 
 
+def looks_like_bot_directed_text(text: str) -> bool:
+    text = strip_mention_noise(text)
+    if not text:
+        return False
+
+    lowered = text.lower()
+    bot_markers = (
+        "机器人",
+        "bot",
+        "ai",
+        "llm",
+        "gpt",
+        "插件",
+        "默认回复",
+        "友好回复",
+        "拦它",
+        "怎么拦",
+        "提交了",
+        "它直接",
+        "它怎么",
+        "你怎么",
+        "你这",
+        "你是不是",
+        "你是",
+        "你妈",
+    )
+    if any(marker in lowered for marker in bot_markers):
+        return True
+
+    question_markers = ("?", "？", "吗", "咋", "怎么", "为啥", "干嘛", "啥意思")
+    second_person_markers = ("你", "它", "这玩意", "这东西")
+    return any(marker in text for marker in second_person_markers) and any(
+        marker in text for marker in question_markers
+    )
+
+
 def format_messages(messages: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for msg in messages:
@@ -1868,6 +1950,8 @@ def build_reply_prompt(
     force_line = (
         "这是别人直接艾特你，尽量回一句真人短话。"
         if is_mention
+        else "这句可能是在接你上一句，能接就短回，不像在跟你说就 SILENT。"
+        if mode == "implicit"
         else "这次是测试指令，可以更积极地给一句。"
         if force
         else "没必要就闭嘴。"
@@ -1875,6 +1959,8 @@ def build_reply_prompt(
     mode_line = (
         "当前场景：有人在群里直接艾特你。你是在回他，不是主动插话。"
         if is_mention
+        else "当前场景：没人艾特你，但这句可能是在跟你说或接你上一句。"
+        if mode == "implicit"
         else "当前场景：你在判断要不要自然插一句。"
     )
     self_start_line = (
@@ -1910,6 +1996,7 @@ def build_reply_prompt(
 - 自创句子要以模糊感受、情绪或日常碎念开头，不要像通知。
 - 自创概率倾向：{self_start_probability:.2f}。{self_start_line}
 - 如果是被直接艾特：不用自创，贴着对方这句话回；能一句话解决就别扩展。
+- 如果是疑似在跟你说话：先判断是不是在接你，不确定就 SILENT，别强行认领。
 - 如果对方只是叫你名字或戳一下，可以回得很懒，比如“干嘛”“咋了”“说”这类感觉，但不要固定复读。
 - 如果你最近有表达线索，可以顺着它继续，但这一条仍然只能短。
 - 真人可以几次短句慢慢表达一个意思，不要在单条里把观点讲完。
