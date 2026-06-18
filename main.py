@@ -288,6 +288,18 @@ class MemoryStore:
                 (next_attempt_at, group_id),
             )
 
+    def clamp_next_attempts(self, latest_next_attempt_at: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                update group_state
+                set next_attempt_at = ?
+                where next_attempt_at > ?
+                """,
+                (latest_next_attempt_at, latest_next_attempt_at),
+            )
+            return int(cur.rowcount or 0)
+
     def mark_spoke(self, group_id: str, text: str) -> None:
         now = int(time.time())
         with self._connect() as conn:
@@ -580,7 +592,7 @@ class MemoryStore:
         )
 
 
-@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.2")
+@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.3")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -593,11 +605,14 @@ class IAintNoRobot(Star):
 
     async def initialize(self) -> None:
         self._migrate_legacy_target_group()
+        if self._migrate_timing_defaults():
+            await self._save_config()
         data_dir = self._plugin_data_dir()
         recent_limit = int(self.config.get("recent_message_limit", 200))
         max_slang_terms = int(self.config.get("max_slang_terms", 80))
         self.store = MemoryStore(data_dir / "memory.sqlite3", recent_limit, max_slang_terms)
         self.store.initialize()
+        self._clamp_next_attempts_to_config()
         self.worker_task = asyncio.create_task(self._background_loop())
         logger.info(f"{PLUGIN_NAME} initialized, data_dir={data_dir}")
 
@@ -1036,7 +1051,7 @@ class IAintNoRobot(Star):
         if state.last_spoke_at and latest_created_at <= state.last_spoke_at:
             return
         if pending.mode == "ambient":
-            speak_gap = int(self.config.get("min_speak_interval_minutes", 45)) * 60
+            speak_gap = int(self.config.get("min_speak_interval_minutes", 5)) * 60
             if state.last_spoke_at and now - state.last_spoke_at < speak_gap:
                 return
 
@@ -1057,7 +1072,7 @@ class IAintNoRobot(Star):
         if state.last_seen_at < now - active_window:
             return False
 
-        speak_gap = int(self.config.get("min_speak_interval_minutes", 45)) * 60
+        speak_gap = int(self.config.get("min_speak_interval_minutes", 5)) * 60
         if state.last_spoke_at and now - state.last_spoke_at < speak_gap:
             return False
 
@@ -1491,15 +1506,15 @@ class IAintNoRobot(Star):
     def _schedule_next_attempt(self, group_id: str) -> None:
         if not self.store:
             return
-        min_min = max(1, int(self.config.get("min_attempt_interval_minutes", 20)))
-        max_min = max(min_min, int(self.config.get("max_attempt_interval_minutes", 80)))
+        min_min = max(1, int(self.config.get("min_attempt_interval_minutes", 5)))
+        max_min = max(min_min, int(self.config.get("max_attempt_interval_minutes", 5)))
         next_at = int(time.time()) + random.randint(min_min * 60, max_min * 60)
         self.store.set_next_attempt(group_id, next_at)
 
     def _schedule_short_retry(self, group_id: str) -> None:
         if not self.store:
             return
-        minutes = max(1, int(self.config.get("no_reply_retry_minutes", 3)))
+        minutes = max(1, int(self.config.get("no_reply_retry_minutes", 5)))
         self.store.set_next_attempt(group_id, int(time.time()) + minutes * 60)
 
     def _remember_event_message(
@@ -1780,6 +1795,35 @@ class IAintNoRobot(Star):
                 self.config["target_group_id"] = ""
             except Exception:
                 pass
+
+    def _migrate_timing_defaults(self) -> bool:
+        old_to_new = {
+            "min_attempt_interval_minutes": (20, 5),
+            "max_attempt_interval_minutes": (80, 5),
+            "no_reply_retry_minutes": (3, 5),
+            "min_speak_interval_minutes": (45, 5),
+        }
+        changed = False
+        for key, (old_value, new_value) in old_to_new.items():
+            try:
+                value = int(self.config.get(key, old_value))
+            except (TypeError, ValueError):
+                value = old_value
+            if value == old_value:
+                self.config[key] = new_value
+                changed = True
+        return changed
+
+    def _clamp_next_attempts_to_config(self) -> None:
+        if not self.store:
+            return
+        max_min = max(1, int(self.config.get("max_attempt_interval_minutes", 5)))
+        latest_next_attempt_at = int(time.time()) + max_min * 60
+        changed_count = self.store.clamp_next_attempts(latest_next_attempt_at)
+        if changed_count:
+            logger.info(
+                f"{PLUGIN_NAME} clamped {changed_count} group attempt timers to {max_min} minutes"
+            )
 
     def _managed_group_exists(self, group_id: str, enabled_only: bool = False) -> bool:
         group_id = str(group_id).strip()
