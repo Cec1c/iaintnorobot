@@ -159,7 +159,8 @@
           const item = document.createElement("li");
           const title = document.createElement("div");
           const state = group.enabled ? "已启用" : "已停用";
-          title.innerHTML = `<strong>${group.name}</strong><div class="muted">${group.group_id} / ${state}</div>`;
+          const ready = group.initialized === false ? "未初始化" : "已初始化";
+          title.innerHTML = `<strong>${group.name}</strong><div class="muted">${group.group_id} / ${state} / ${ready}</div>`;
 
           const actions = document.createElement("div");
           actions.className = "actions";

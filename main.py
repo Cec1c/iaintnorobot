@@ -212,6 +212,7 @@ class MemoryStore:
                 ) values (?, ?, ?, ?, ?)
                 on conflict(group_id) do update set
                     unified_msg_origin = excluded.unified_msg_origin,
+                    enabled = excluded.enabled,
                     last_seen_at = excluded.last_seen_at
                 """,
                 (group_id, umo, 1 if enabled else 0, now, now),
@@ -273,6 +274,11 @@ class MemoryStore:
                 "select group_id from group_state order by first_seen_at asc limit 1"
             ).fetchone()
         return str(row["group_id"]) if row else None
+
+    def list_states(self) -> list[GroupState]:
+        with self._connect() as conn:
+            rows = conn.execute("select * from group_state").fetchall()
+        return [self._row_to_state(row) for row in rows]
 
     def set_enabled(self, group_id: str, enabled: bool) -> None:
         with self._connect() as conn:
@@ -592,7 +598,7 @@ class MemoryStore:
         )
 
 
-@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.3")
+@register(PLUGIN_NAME, "15185", "低频自然插话原型", "0.4.4")
 class IAintNoRobot(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -601,6 +607,7 @@ class IAintNoRobot(Star):
         self.worker_task: asyncio.Task | None = None
         self.pending_reply_tasks: dict[str, asyncio.Task] = {}
         self.active_group_id = ""
+        self.unresolved_group_ids: set[str] = set()
         self._register_page_apis(context)
 
     async def initialize(self) -> None:
@@ -612,6 +619,7 @@ class IAintNoRobot(Star):
         max_slang_terms = int(self.config.get("max_slang_terms", 80))
         self.store = MemoryStore(data_dir / "memory.sqlite3", recent_limit, max_slang_terms)
         self.store.initialize()
+        self._bootstrap_configured_groups()
         self._clamp_next_attempts_to_config()
         self.worker_task = asyncio.create_task(self._background_loop())
         logger.info(f"{PLUGIN_NAME} initialized, data_dir={data_dir}")
@@ -721,6 +729,8 @@ class IAintNoRobot(Star):
             return
         name = safe_call(event, "get_group_name") or f"群 {group_id}"
         added = self._ensure_managed_group(group_id, name, enabled=True)
+        if self.store:
+            self.store.ensure_group(group_id, event.unified_msg_origin, True)
         await self._save_config()
         yield event.plain_result("加好了" if added else "已经在列表里了")
 
@@ -734,7 +744,9 @@ class IAintNoRobot(Star):
         lines = []
         for group in groups:
             enabled = "开" if group["enabled"] else "关"
-            lines.append(f"- {group['name']} / {group['group_id']} / {enabled}")
+            state = self.store.get_state(group["group_id"]) if self.store else None
+            ready = "已初始化" if state and state.unified_msg_origin else "未初始化"
+            lines.append(f"- {group['name']} / {group['group_id']} / {enabled} / {ready}")
         yield event.plain_result("\n".join(lines))
 
     @iar.command("say")
@@ -948,6 +960,9 @@ class IAintNoRobot(Star):
     async def _tick_group(self, group_id: str) -> None:
         assert self.store is not None
         if not self._is_group_allowed(group_id):
+            return
+        state = self._ensure_target_group_state(group_id)
+        if not state:
             return
         await self._maybe_refresh_summary(group_id)
         await self._maybe_refresh_slang(group_id)
@@ -1451,10 +1466,18 @@ class IAintNoRobot(Star):
 
     async def _send_to_group(self, group_id: str, text: str) -> None:
         assert self.store is not None
-        state = self.store.get_state(group_id)
+        state = self._ensure_target_group_state(group_id)
         if not state:
             return
-        await self.context.send_message(state.unified_msg_origin, MessageChain().message(text))
+        sent = await self.context.send_message(
+            state.unified_msg_origin,
+            MessageChain().message(text),
+        )
+        if sent is False:
+            logger.warning(
+                f"{PLUGIN_NAME} cannot send to group {group_id}, session={state.unified_msg_origin}"
+            )
+            return
         self.store.mark_spoke(group_id, text)
         await self._refresh_viewpoint(group_id)
         self._schedule_next_attempt(group_id)
@@ -1702,7 +1725,7 @@ class IAintNoRobot(Star):
     async def _api_groups(self, *args: Any):
         return json_response(
             {
-                "groups": self._managed_groups(include_disabled=True),
+                "groups": self._managed_groups_for_ui(),
             }
         )
 
@@ -1714,8 +1737,10 @@ class IAintNoRobot(Star):
             return self._web_error("群号不能为空")
         enabled = bool(payload.get("enabled", True))
         self._ensure_managed_group(group_id, name, enabled=enabled)
+        if enabled:
+            self._ensure_target_group_state(group_id)
         await self._save_config()
-        return json_response({"ok": True, "groups": self._managed_groups(include_disabled=True)})
+        return json_response({"ok": True, "groups": self._managed_groups_for_ui()})
 
     async def _api_set_group_enabled(self, *args: Any):
         payload = await self._request_json(args[0] if args else None)
@@ -1724,10 +1749,12 @@ class IAintNoRobot(Star):
             return self._web_error("群聊不存在")
         enabled = bool(payload.get("enabled", True))
         self._set_managed_group_enabled(group_id, enabled)
-        if self.store:
+        if enabled:
+            self._ensure_target_group_state(group_id)
+        elif self.store:
             self.store.set_enabled(group_id, enabled)
         await self._save_config()
-        return json_response({"ok": True, "groups": self._managed_groups(include_disabled=True)})
+        return json_response({"ok": True, "groups": self._managed_groups_for_ui()})
 
     async def _api_remove_group(self, *args: Any):
         payload = await self._request_json(args[0] if args else None)
@@ -1742,7 +1769,7 @@ class IAintNoRobot(Star):
         return json_response(
             {
                 "ok": True,
-                "groups": self._managed_groups(include_disabled=True),
+                "groups": self._managed_groups_for_ui(),
             }
         )
 
@@ -1786,6 +1813,13 @@ class IAintNoRobot(Star):
             seen.add(group_id)
         return groups
 
+    def _managed_groups_for_ui(self) -> list[dict[str, Any]]:
+        groups = self._managed_groups(include_disabled=True)
+        for group in groups:
+            state = self.store.get_state(group["group_id"]) if self.store else None
+            group["initialized"] = bool(state and state.unified_msg_origin)
+        return groups
+
     def _migrate_legacy_target_group(self) -> None:
         target_group_id = str(self.config.get("target_group_id", "")).strip()
         if target_group_id and not self._managed_group_exists(target_group_id):
@@ -1824,6 +1858,71 @@ class IAintNoRobot(Star):
             logger.info(
                 f"{PLUGIN_NAME} clamped {changed_count} group attempt timers to {max_min} minutes"
             )
+
+    def _bootstrap_configured_groups(self) -> None:
+        for group in self._managed_groups(include_disabled=False):
+            self._ensure_target_group_state(group["group_id"])
+
+    def _ensure_target_group_state(self, group_id: str) -> GroupState | None:
+        if not self.store:
+            return None
+        group_id = str(group_id).strip()
+        if not group_id or not self._is_group_allowed(group_id):
+            return None
+
+        state = self.store.get_state(group_id)
+        if state and state.unified_msg_origin:
+            self.store.set_enabled(group_id, True)
+            return state
+
+        umo = self._infer_group_umo(group_id)
+        if not umo:
+            if group_id not in self.unresolved_group_ids:
+                logger.info(
+                    f"{PLUGIN_NAME} group {group_id} has no session yet; "
+                    "send one message in that group or use /iar addgroup there"
+                )
+                self.unresolved_group_ids.add(group_id)
+            return state
+
+        self.store.ensure_group(group_id, umo, True)
+        self.unresolved_group_ids.discard(group_id)
+        return self.store.get_state(group_id)
+
+    def _infer_group_umo(self, group_id: str) -> str | None:
+        if not group_id:
+            return None
+        if self.store:
+            state = self.store.get_state(group_id)
+            if state and state.unified_msg_origin:
+                return state.unified_msg_origin
+
+        platform_id = self._known_group_platform_id()
+        if not platform_id:
+            return None
+        return f"{platform_id}:GroupMessage:{group_id}"
+
+    def _known_group_platform_id(self) -> str | None:
+        if self.store:
+            for state in self.store.list_states():
+                parts = state.unified_msg_origin.split(":", 2)
+                if len(parts) == 3 and parts[0] and parts[1] == "GroupMessage":
+                    return parts[0]
+
+        platform_manager = getattr(self.context, "platform_manager", None)
+        platforms = list(getattr(platform_manager, "platform_insts", []) or [])
+        platform_ids: list[str] = []
+        for platform in platforms:
+            try:
+                meta = platform.meta()
+                platform_id = str(getattr(meta, "id", "") or "")
+            except Exception:
+                platform_id = ""
+            if platform_id:
+                platform_ids.append(platform_id)
+        if len(platform_ids) == 1:
+            return platform_ids[0]
+        return None
 
     def _managed_group_exists(self, group_id: str, enabled_only: bool = False) -> bool:
         group_id = str(group_id).strip()
